@@ -18,6 +18,7 @@ import argparse
 import base64
 import json
 import os
+import random
 import secrets
 import sys
 import time
@@ -25,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 from pathlib import Path
 
 from curl_cffi import requests
@@ -48,6 +50,7 @@ CPA_GROK_HEADERS = {
     "x-grok-client-version": "0.2.93",
     "x-grok-client-identifier": "grok-shell",
 }
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -80,23 +83,193 @@ def _urlopen(req, proxy: str = "", timeout: int = 15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def request_device_code(proxy: str = "", log=print) -> dict | None:
+def retry_request(operation: str, request, retries: int, retry_delay: float, log=print):
+    """Retry transient transport and upstream errors with bounded exponential backoff."""
+    retries = max(0, int(retries))
+    for attempt in range(retries + 1):
+        try:
+            response = request()
+            status = getattr(response, "status_code", getattr(response, "code", None))
+            if status not in RETRYABLE_HTTP_STATUS or attempt == retries:
+                return response
+            reason = f"HTTP {status}"
+        except urllib.error.HTTPError as exc:
+            if exc.code not in RETRYABLE_HTTP_STATUS or attempt == retries:
+                raise
+            reason = f"HTTP {exc.code}"
+        except Exception as exc:
+            if attempt == retries:
+                raise
+            reason = type(exc).__name__
+
+        delay = retry_delay * (2**attempt) + random.uniform(0, min(0.25, retry_delay))
+        log(f"  ↻ {operation} {reason}; retry {attempt + 1}/{retries} in {delay:.1f}s")
+        time.sleep(delay)
+
+
+class RelaySession:
+    """Route absolute upstream URLs through the header-based Netlify relay."""
+
+    def __init__(self, relay_url: str, sso_cookie: str, proxy: str = "", relay_key: str = ""):
+        self.relay_url = relay_url.rstrip("/") + "/"
+        self.relay_key = relay_key
+        self.session = requests.Session()
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+        self.upstream_cookies = [
+            {"name": "sso", "value": sso_cookie, "domain": ".x.ai", "path": "/"}
+        ]
+
+    def _store_cookies(self, response, upstream_url: str) -> None:
+        try:
+            values = response.headers.get_list("set-cookie")
+        except AttributeError:
+            values = [response.headers.get("set-cookie", "")]
+        default_domain = urllib.parse.urlsplit(upstream_url).hostname or ""
+        for value in values:
+            parsed = SimpleCookie()
+            try:
+                parsed.load(value)
+            except Exception:
+                continue
+            for name, morsel in parsed.items():
+                domain = (morsel["domain"] or default_domain).lower()
+                path = morsel["path"] or "/"
+                self.upstream_cookies = [
+                    cookie
+                    for cookie in self.upstream_cookies
+                    if not (cookie["name"] == name and cookie["domain"] == domain and cookie["path"] == path)
+                ]
+                self.upstream_cookies.append(
+                    {"name": name, "value": morsel.value, "domain": domain, "path": path}
+                )
+
+    def _cookie_header(self, target) -> str:
+        host = (target.hostname or "").lower()
+        path = target.path or "/"
+        matched = []
+        for cookie in self.upstream_cookies:
+            domain = cookie["domain"].lstrip(".")
+            if host != domain and not host.endswith("." + domain):
+                continue
+            if not path.startswith(cookie["path"]):
+                continue
+            matched.append(f'{cookie["name"]}={cookie["value"]}')
+        return "; ".join(matched)
+
+    def request(self, method: str, url: str, **kwargs):
+        follow_redirects = kwargs.pop("allow_redirects", True)
+        redirect_limit = kwargs.pop("_relay_redirect_limit", 10)
+        target = urllib.parse.urlsplit(url)
+        if target.scheme not in {"http", "https"} or not target.netloc:
+            raise ValueError(f"Relay requires an absolute HTTP URL: {url}")
+
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["x-relay-target"] = f"{target.scheme}://{target.netloc}"
+        headers["x-relay-path"] = urllib.parse.urlunsplit(("", "", target.path or "/", target.query, ""))
+        if self.relay_key:
+            headers["x-relay-key"] = self.relay_key
+        cookie_header = self._cookie_header(target)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+
+        response = self.session.request(
+            method,
+            self.relay_url,
+            headers=headers,
+            allow_redirects=False,
+            **kwargs,
+        )
+        self._store_cookies(response, url)
+
+        location = response.headers.get("location")
+        if (
+            follow_redirects
+            and redirect_limit > 0
+            and response.status_code in {301, 302, 303, 307, 308}
+            and location
+        ):
+            next_method = method
+            next_kwargs = dict(kwargs)
+            if response.status_code in {301, 302, 303} and method.upper() != "GET":
+                next_method = "GET"
+                next_kwargs.pop("data", None)
+                next_kwargs.pop("json", None)
+            next_kwargs["_relay_redirect_limit"] = redirect_limit - 1
+            return self.request(next_method, urllib.parse.urljoin(url, location), **next_kwargs)
+
+        response.relay_upstream_url = url
+        return response
+
+    def get(self, url: str, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+
+def _response_url(response) -> str:
+    return getattr(response, "relay_upstream_url", response.url)
+
+
+def request_device_code(
+    proxy: str = "",
+    relay_session: RelaySession | None = None,
+    retries: int = 3,
+    retry_delay: float = 1.0,
+    log=print,
+) -> dict | None:
     data = urllib.parse.urlencode({"client_id": CLIENT_ID, "scope": SCOPES}).encode()
-    req = urllib.request.Request(
-        f"{OIDC_ISSUER}/oauth2/device/code",
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
+    if relay_session:
+        try:
+            response = retry_request(
+                "device/code",
+                lambda: relay_session.post(
+                    f"{OIDC_ISSUER}/oauth2/device/code",
+                    data=data,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    impersonate="chrome",
+                    timeout=15,
+                ),
+                retries,
+                retry_delay,
+                log,
+            )
+            if response.status_code >= 400:
+                log(f"  ❌ device/code HTTP {response.status_code}")
+                return None
+            return response.json()
+        except Exception as e:
+            log(f"  ❌ device/code 网络错误: {e}")
+            return None
     try:
-        with _urlopen(req, proxy=proxy, timeout=15) as resp:
-            return json.loads(resp.read())
+        def post_device_code():
+            req = urllib.request.Request(
+                f"{OIDC_ISSUER}/oauth2/device/code",
+                data=data,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with _urlopen(req, proxy=proxy, timeout=15) as resp:
+                return json.loads(resp.read())
+
+        return retry_request("device/code", post_device_code, retries, retry_delay, log)
     except urllib.error.HTTPError as e:
         log(f"  ❌ device/code HTTP {e.code}: {e.read().decode()[:200]}")
         return None
 
 
-def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 60, proxy: str = "", log=print) -> dict | None:
+def poll_token(
+    device_code: str,
+    interval: int,
+    expires_in: int,
+    timeout: int = 60,
+    proxy: str = "",
+    relay_session: RelaySession | None = None,
+    retries: int = 3,
+    retry_delay: float = 1.0,
+    log=print,
+) -> dict | None:
     deadline = time.time() + min(expires_in, timeout)
     while time.time() < deadline:
         time.sleep(interval)
@@ -107,15 +280,47 @@ def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 
                 "device_code": device_code,
             }
         ).encode()
-        req = urllib.request.Request(
-            f"{OIDC_ISSUER}/oauth2/token",
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        if relay_session:
+            try:
+                response = retry_request(
+                    "token",
+                    lambda: relay_session.post(
+                        f"{OIDC_ISSUER}/oauth2/token",
+                        data=data,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        impersonate="chrome",
+                        timeout=15,
+                    ),
+                    retries,
+                    retry_delay,
+                    log,
+                )
+                if response.status_code < 400:
+                    return response.json()
+                err = response.json()
+                error = err.get("error", "")
+            except Exception as e:
+                log(f"  ❌ token 网络错误: {e}")
+                return None
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                interval += 5
+                continue
+            log(f"  ❌ token: {error or f'HTTP {response.status_code}'}")
+            return None
         try:
-            with _urlopen(req, proxy=proxy, timeout=15) as resp:
-                return json.loads(resp.read())
+            def post_token():
+                req = urllib.request.Request(
+                    f"{OIDC_ISSUER}/oauth2/token",
+                    data=data,
+                    method="POST",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                with _urlopen(req, proxy=proxy, timeout=15) as resp:
+                    return json.loads(resp.read())
+
+            return retry_request("token", post_token, retries, retry_delay, log)
         except urllib.error.HTTPError as e:
             err = json.loads(e.read())
             error = err.get("error", "")
@@ -130,63 +335,110 @@ def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 
     return None
 
 
-def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in)。proxy 非空时全程走代理。"""
+def sso_to_token(
+    sso_cookie: str,
+    proxy: str = "",
+    relay_url: str = "",
+    relay_key: str = "",
+    retries: int = 3,
+    retry_delay: float = 1.0,
+    log=print,
+) -> dict | None:
+    """SSO cookie → token dict (access/refresh/expires_in)。可选全程走 header relay。"""
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    s = requests.Session()
-    if proxies:
-        s.proxies = proxies
-    s.cookies.set("sso", sso_cookie, domain=".x.ai")
+    if relay_url:
+        s = RelaySession(relay_url, sso_cookie, proxy=proxy, relay_key=relay_key)
+    else:
+        s = requests.Session()
+        if proxies:
+            s.proxies = proxies
+        s.cookies.set("sso", sso_cookie, domain=".x.ai")
 
     try:
-        r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
+        r = retry_request(
+            "SSO validation",
+            lambda: s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15),
+            retries,
+            retry_delay,
+            log,
+        )
     except Exception as e:
         log(f"  ❌ 网络错误: {e}")
         return None
-    if "sign-in" in r.url or "sign-up" in r.url:
+    final_url = _response_url(r)
+    if r.status_code >= 400:
+        log(f"  ❌ sso 验证 HTTP {r.status_code}")
+        return None
+    if "sign-in" in final_url or "sign-up" in final_url:
         log("  ❌ sso 无效")
         return None
     log("  ✅ sso 有效")
 
     log("  🔑 Device Flow...")
-    dc = request_device_code(proxy=proxy, log=log)
+    dc = request_device_code(
+        proxy=proxy,
+        relay_session=s if relay_url else None,
+        retries=retries,
+        retry_delay=retry_delay,
+        log=log,
+    )
     if not dc:
         return None
     log(f"  📋 user_code: {dc.get('user_code')}")
 
     try:
-        s.get(dc["verification_uri_complete"], impersonate="chrome", timeout=15)
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/verify",
-            data={"user_code": dc["user_code"]},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
+        retry_request(
+            "device verification page",
+            lambda: s.get(dc["verification_uri_complete"], impersonate="chrome", timeout=15),
+            retries,
+            retry_delay,
+            log,
         )
-        if "consent" not in r.url:
-            log(f"  ❌ verify 失败: {r.url}")
+        r = retry_request(
+            "device verify",
+            lambda: s.post(
+                f"{OIDC_ISSUER}/oauth2/device/verify",
+                data={"user_code": dc["user_code"]},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=True,
+            ),
+            retries,
+            retry_delay,
+            log,
+        )
+        final_url = _response_url(r)
+        if "consent" not in final_url:
+            log(f"  ❌ verify 失败: {final_url}")
             return None
     except Exception as e:
         log(f"  ❌ verify 异常: {e}")
         return None
 
     try:
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/approve",
-            data={
-                "user_code": dc["user_code"],
-                "action": "allow",
-                "principal_type": "User",
-                "principal_id": "",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
+        r = retry_request(
+            "device approve",
+            lambda: s.post(
+                f"{OIDC_ISSUER}/oauth2/device/approve",
+                data={
+                    "user_code": dc["user_code"],
+                    "action": "allow",
+                    "principal_type": "User",
+                    "principal_id": "",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=True,
+            ),
+            retries,
+            retry_delay,
+            log,
         )
-        if "done" not in r.url:
-            log(f"  ❌ approve 失败: {r.url}")
+        final_url = _response_url(r)
+        if "done" not in final_url:
+            log(f"  ❌ approve 失败: {final_url}")
             return None
         log("  ✅ 授权确认")
     except Exception as e:
@@ -198,6 +450,9 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         dc.get("interval", 5),
         dc.get("expires_in", 1800),
         proxy=proxy,
+        relay_session=s if relay_url else None,
+        retries=retries,
+        retry_delay=retry_delay,
         log=log,
     )
     if not token:
@@ -450,6 +705,14 @@ def main() -> int:
         help="远程 CPA 管理密钥（remote-management.secret-key 明文）",
     )
     ap.add_argument("--proxy", default="", help="device-flow 走代理，如 http://127.0.0.1:7890")
+    ap.add_argument("--retries", type=int, default=3, help="每个临时网络失败后的额外重试次数")
+    ap.add_argument("--retry-delay", type=float, default=1.0, help="首次重试等待秒数（后续指数退避）")
+    ap.add_argument(
+        "--relay-url",
+        default="",
+        help="header relay 地址；所有 accounts.x.ai/auth.x.ai 请求经该 relay 转发",
+    )
+    ap.add_argument("--relay-key", default="", help="可选 relay 的 x-relay-key")
     args = ap.parse_args()
 
     cookies = load_sso_list(args.sso, args.sso_cookie)
@@ -460,8 +723,18 @@ def main() -> int:
         ap.error("使用 --cpa-remote-url 时必须同时提供 --cpa-management-key")
     if args.cpa_management_key and not args.cpa_remote_url:
         ap.error("使用 --cpa-management-key 时必须同时提供 --cpa-remote-url")
+    if args.retries < 0:
+        ap.error("--retries 不能小于 0")
+    if args.retry_delay < 0:
+        ap.error("--retry-delay 不能小于 0")
 
-    if len(cookies) > 1 and not args.out_dir and not args.merge:
+    if (
+        len(cookies) > 1
+        and not args.out_dir
+        and not args.merge
+        and not args.cpa_auth_dir
+        and not args.cpa_remote_url
+    ):
         # 默认批量写目录
         args.out_dir = args.out_dir or "./auth_out"
         print(f"批量模式默认 --out-dir {args.out_dir}")
@@ -483,7 +756,14 @@ def main() -> int:
     for i, sso in enumerate(cookies, 1):
         print(f"\n{'=' * 60}\n[{i}/{len(cookies)}] ...\n{'=' * 60}")
         try:
-            token = sso_to_token(sso, proxy=args.proxy)
+            token = sso_to_token(
+                sso,
+                proxy=args.proxy,
+                relay_url=args.relay_url,
+                relay_key=args.relay_key,
+                retries=args.retries,
+                retry_delay=args.retry_delay,
+            )
             if not token:
                 fail += 1
                 print(f"  ❌ [{i}] 失败")

@@ -24,6 +24,8 @@ auth_merged.json
 *.auth.json
 sso_list.txt
 token.json
+grok2api/
+grok2api/cpa_export*/
 
 *.log
 .DS_Store
