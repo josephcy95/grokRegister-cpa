@@ -118,29 +118,43 @@ def convert_entry(
         append_log(log_path, message)
 
     log(f"{prefix} line={entry.line_no} begin")
-    try:
-        token = sso_to_token(
-            entry.sso,
-            proxy=proxy,
-            retries=retries,
-            retry_delay=retry_delay,
-            log=log,
-        )
-        if not token:
-            log(f"{prefix} line={entry.line_no} failed")
-            return False
-
-        record = token_to_cpa_record(token)
-        path = write_cpa_auth(output_dir, record)
+    # sso_to_token is upstream auth-code flow (no retries/relay kwargs).
+    # Keep batch resilience here with local bounded retries around that call.
+    attempts = max(0, int(retries)) + 1
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
         try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-        log(f"{prefix} line={entry.line_no} wrote={path.name}")
-        return True
-    except Exception as exc:
-        log(f"{prefix} line={entry.line_no} exception={type(exc).__name__}: {exc}")
-        return False
+            token = sso_to_token(
+                entry.sso,
+                proxy=proxy,
+                log=log,
+            )
+            if token:
+                record = token_to_cpa_record(token)
+                path = write_cpa_auth(output_dir, record)
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
+                log(f"{prefix} line={entry.line_no} wrote={path.name}")
+                return True
+            log(f"{prefix} line={entry.line_no} attempt={attempt}/{attempts} no token")
+        except Exception as exc:
+            last_exc = exc
+            log(
+                f"{prefix} line={entry.line_no} attempt={attempt}/{attempts} "
+                f"exception={type(exc).__name__}: {exc}"
+            )
+        if attempt < attempts:
+            delay = float(retry_delay) * (2 ** (attempt - 1))
+            log(f"{prefix} line={entry.line_no} retry in {delay:.1f}s")
+            time.sleep(delay)
+
+    if last_exc is not None:
+        log(f"{prefix} line={entry.line_no} failed after retries: {last_exc}")
+    else:
+        log(f"{prefix} line={entry.line_no} failed")
+    return False
 
 
 def worker(
@@ -378,8 +392,18 @@ def main() -> int:
     ap.add_argument("--proxy-end", type=int, default=8040, help="Last local proxy port")
     ap.add_argument("--proxy-ports", default="", help="Comma/range ports, e.g. 8021-8040 or 8021,8024")
     ap.add_argument("--workers", type=int, default=0, help="Max parallel workers; default number of proxies")
-    ap.add_argument("--retries", type=int, default=3, help="Retries passed to sso_to_auth_json")
-    ap.add_argument("--retry-delay", type=float, default=1.0, help="Initial retry delay passed to sso_to_auth_json")
+    ap.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Extra local retries around sso_to_token (upstream auth-code has no built-in retries)",
+    )
+    ap.add_argument(
+        "--retry-delay",
+        type=float,
+        default=1.0,
+        help="Initial local retry delay seconds (exponential backoff)",
+    )
     ap.add_argument("--delay", type=float, default=0.0, help="Delay between tokens inside each proxy worker")
     ap.add_argument(
         "--retry-across-proxies",
