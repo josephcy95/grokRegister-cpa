@@ -341,11 +341,19 @@ def _safe_email_for_filename(email: str) -> str:
     return safe or "unknown"
 
 
-def token_to_cpa_record(token: dict, email: str = "", sso: str = "") -> dict:
+def token_to_cpa_record(
+    token: dict,
+    email: str = "",
+    sso: str = "",
+    note: str = "",
+) -> dict:
     """token dict → CLIProxyAPI 扁平 xai auth 记录。
 
     对齐 CPA internal/auth/xai/token.go 的 TokenStorage 字段，以及
     grok-build-auth build_cliproxyapi_auth_record 的输出。
+
+    Optional ``note`` tags how the account was registered, e.g.
+    ``"Roxy - Capmonster - No Proxy"``.
     """
     access = token.get("access_token") or token.get("key") or ""
     refresh = token.get("refresh_token") or ""
@@ -388,6 +396,9 @@ def token_to_cpa_record(token: dict, email: str = "", sso: str = "") -> dict:
     sso_val = str(sso or "").strip()
     if sso_val:
         record["sso"] = sso_val
+    note_val = str(note or "").strip()
+    if note_val:
+        record["note"] = note_val
     return record
 
 

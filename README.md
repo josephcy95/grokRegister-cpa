@@ -32,7 +32,8 @@
 
 - 注册成功后自动入库 CPA（本地目录 / 远程 Management API，可同时开）
 - GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
-- Chromium/Chrome 自动处理 Turnstile
+- 三浏览器驱动：本地 Chromium（DrissionPage）、[Browser Use Cloud](https://docs.browser-use.com/cloud/browser/stealth) stealth + 住宅代理（Playwright CDP）、[RoxyBrowser](https://github.com/roxybrowser) 指纹浏览器（本地 API create/open + DrissionPage 附着）
+- Chromium/Chrome 自动处理 Turnstile（本地 / Roxy 驱动）
 - DuckMail / YYDS / Cloudflare 临时邮箱
 - 注册后可选开启 NSFW
 - 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
@@ -41,7 +42,9 @@
 ## 环境要求
 
 - Python 3.9+
-- Google Chrome 或 Chromium
+- 本地驱动：Google Chrome 或 Chromium
+- Browser Use 驱动：`playwright` Python 包 + Browser Use API Key（**无需**本机安装 Chromium）
+- Roxy 驱动：本机已安装并登录 [RoxyBrowser](https://www.roxybrowser.com/)，开启本地 API（默认 `http://127.0.0.1:50000`）并填写 API Token
 - 可用的 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
 - 能访问注册页、临时邮箱 API、`auth.x.ai` 的网络（授权码流程换 token 需要）
 
@@ -51,6 +54,8 @@
 git clone https://github.com/Git-creat7/grokRegister-cpa.git
 cd grokRegister-cpa
 pip install -r requirements.txt
+# Browser Use 只需 Python 包；远端浏览器由 Browser Use 托管
+# uv pip install playwright
 cp config.example.json config.json
 ```
 
@@ -79,6 +84,98 @@ cp config.example.json config.json
 | `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
 | `cloudflare_path_*` | domains / accounts / token / messages 路径 |
 | `defaultDomains` | Cloudflare 默认收信域名 |
+| `browser_driver` | `local` / `browser_use` / `roxy` |
+| `browser_use_api_key` | Browser Use Cloud API Key（也可用环境变量 `BROWSER_USE_API_KEY`） |
+| `browser_use_proxy_country` | 代理国家代码，如 `us` / `jp` / `sg` / `de`（两位小写） |
+| `browser_use_use_proxy` | `true` 时连接参数带 `proxyCountryCode` |
+| `browser_use_profile_id` | 可选；固定 profile 复用 cookies（批量注册建议留空） |
+| `browser_use_cdp_base` | 默认 `wss://connect.browser-use.com` |
+| `browser_use_timeout_minutes` | 远端会话超时（分钟，默认 15，最大 240） |
+| `browser_use_nav_timeout` | Playwright 导航/操作超时（秒） |
+| `roxy_api_base` | Roxy 本地 API，默认 `http://127.0.0.1:50000` |
+| `roxy_api_token` | Roxy API Token（也可用环境变量 `ROXY_API_TOKEN`） |
+| `roxy_workspace_id` | 工作区 ID；留空时启动时自动从 `/browser/workspace` 探测 |
+| `roxy_project_id` | 可选项目 ID |
+| `roxy_profile_id` | **一号一环境时必须留空**；仅复用固定环境时填写 |
+| `roxy_one_profile_per_account` | `true`（默认）：每账号 create 新环境，结束后 close+delete |
+| `roxy_delete_profile_after_run` | 一号一环境结束后是否删除 Profile（默认 `true`） |
+| `roxy_keep_browser_open` | 调试用；`true` 时不 close/delete |
+| `roxy_open_headless` | 是否无头打开 Roxy 窗口 |
+| `roxy_default_os` | 创建指纹 OS：`Windows` / `macOS` / `Linux` 等 |
+| `roxy_create_use_proxy` | `true` 时把 `config.proxy` 写入 Roxy `proxyInfo` |
+
+### Browser Use Cloud（推荐，规避本机 Chromium / 指纹问题）
+
+与 [turb-gpt-free-register](https://github.com/josephcy95/turb-gpt-free-register) 相同接入方式：Playwright `connect_over_cdp` 到 Browser Use stealth Chromium。
+
+```json
+{
+  "browser_driver": "browser_use",
+  "browser_use_api_key": "bu_...",
+  "browser_use_proxy_country": "us",
+  "browser_use_use_proxy": true,
+  "browser_use_timeout_minutes": 15
+}
+```
+
+CLI 示例：
+
+```bash
+# 使用 Browser Use + 美国出口
+python grok_register_ttk.py cli --driver browser_use --country us --count 1
+
+# API Key 也可环境变量
+export BROWSER_USE_API_KEY=bu_...
+python grok_register_ttk.py cli --driver browser_use --country jp
+
+# 回到本机 Chromium
+python grok_register_ttk.py cli --driver local --count 1
+```
+
+GUI：配置区选择 **浏览器驱动** = `browser_use`，填写 API Key / 国家代码后开始。
+
+文档：
+- https://docs.browser-use.com/cloud/browser/stealth
+- https://docs.browser-use.com/cloud/browser/playwright-puppeteer-selenium
+
+### RoxyBrowser（本地指纹浏览器，一号一环境）
+
+与 turb-gpt-free-register 相同思路：调用 Roxy 本地 API **创建 → 打开 → 附着 debuggerAddress → 注册 → 关闭并删除**。
+
+前提：
+1. 本机已安装并登录 RoxyBrowser
+2. 设置里开启 API，地址一般为 `http://127.0.0.1:50000`
+3. 复制 API Token
+
+```json
+{
+  "browser_driver": "roxy",
+  "roxy_api_base": "http://127.0.0.1:50000",
+  "roxy_api_token": "你的token",
+  "roxy_workspace_id": "",
+  "roxy_one_profile_per_account": true,
+  "roxy_delete_profile_after_run": true,
+  "roxy_default_os": "Windows"
+}
+```
+
+- `roxy_workspace_id` 可留空：启动时会请求 `/browser/workspace` 自动选第一个工作区/项目
+- **一号一环境**：每个账号强制 `create` 新 Profile，`stop_browser` / 重启浏览器时 `close` + `delete`；不要填 `roxy_profile_id`
+- 需要给 Roxy 环境挂代理时：设置 `proxy` + `"roxy_create_use_proxy": true`
+
+CLI：
+
+```bash
+export ROXY_API_TOKEN=你的token
+python grok_register_ttk.py cli --driver roxy --count 1
+
+# 或显式传参
+python grok_register_ttk.py cli --driver roxy --roxy-token 你的token --roxy-base http://127.0.0.1:50000
+```
+
+GUI：驱动选 `roxy`，填 **Roxy Token**（及可选 Workspace ID），勾选「一号一环境」。
+
+说明：Roxy 提供真实 antidetect 指纹与独立 cookie 环境，**不保证**自动通过 Cloudflare Turnstile；若注册页仍卡验证码，需另接求解器或人工。
 
 ### Cloudflare 邮箱（默认匿名）
 
