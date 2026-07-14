@@ -103,6 +103,23 @@ cp config.example.json config.json
 | `roxy_open_headless` | 是否无头打开 Roxy 窗口 |
 | `roxy_default_os` | 创建指纹 OS：`Windows` / `macOS` / `Linux` 等 |
 | `roxy_create_use_proxy` | `true` 时把 `config.proxy` 写入 Roxy `proxyInfo` |
+| `roxy_load_turnstile_extension` | `true`（默认）：创建/打开环境时尝试注入 `turnstilePatch/` 路径 |
+| `roxy_turnstile_extension_path` | 扩展目录绝对路径；留空则用仓库内 `turnstilePatch/` |
+| `capmonster_enabled` / `capmonster_api_key` | 可选云解 Turnstile；关掉或留空 key 则走本地点击 + 扩展 |
+| `turnstile_warmup_seconds` | 填完资料后预热秒数（默认 `2`），给 iframe / once-click 扩展时间 |
+| `turnstile_force_enable_submit` | token 已就绪但 Complete 仍 disabled 时强制启用（默认 `true`） |
+
+### 并发模型（顺序，非并行）
+
+注册是 **顺序 / 单账号流水线**，不是多浏览器并行：
+
+- GUI / CLI 在 **一个** 后台线程里跑 `for i in range(count)`（`register_count`）
+- 同一时刻只开 **一个** 浏览器会话（local / Roxy profile / Browser Use session）
+- `register_count: N` 表示 **连续做 N 个账号**，前一个成功或失败后再开下一个
+- Roxy 一号一环境：账号 i create → 注册 → close+delete → 账号 i+1 再 create
+- **没有** 多 worker / 多 profile 并行注册；`parallel_sso_convert.py` 只对已有 SSO 做 CPA 转换并行，与注册无关
+
+若要更高吞吐，只能开多个进程/机器并自备多出口 IP（本仓库未内置）。
 
 ### Browser Use Cloud（推荐，规避本机 Chromium / 指纹问题）
 
@@ -162,6 +179,12 @@ GUI：配置区选择 **浏览器驱动** = `browser_use`，填写 API Key / 国
 - `roxy_workspace_id` 可留空：启动时会请求 `/browser/workspace` 自动选第一个工作区/项目
 - **一号一环境**：每个账号强制 `create` 新 Profile，`stop_browser` / 重启浏览器时 `close` + `delete`；不要填 `roxy_profile_id`
 - 需要给 Roxy 环境挂代理时：设置 `proxy` + `"roxy_create_use_proxy": true`
+- **Turnstile 扩展**：默认 `roxy_load_turnstile_extension: true`，创建时会把本仓库 `turnstilePatch/` 路径写入 create/open 的 `extensionPath` / `--load-extension=...`（**不同 Roxy 版本字段可能被忽略**）。若 GUI 里看不到扩展：
+  1. 日志应有 `[Roxy] turnstilePatch path=...`
+  2. 临时 `roxy_delete_profile_after_run: false` 打开环境，在 Roxy 里确认扩展
+  3. 若 API 不支持路径注入：在 Roxy GUI **手动 Load unpacked** `turnstilePatch/` 做成模板，或把绝对路径写到 `roxy_turnstile_extension_path` / `roxy_profile_create_payload`
+  4. 详见 [`turnstilePatch/README.md`](turnstilePatch/README.md)
+- 关 CapMonster 时仍可用扩展 once-click + `turnstile_warmup_seconds` + force-enable；managed CF 仍强烈依赖 IP
 
 CLI：
 
@@ -171,11 +194,14 @@ python grok_register_ttk.py cli --driver roxy --count 1
 
 # 或显式传参
 python grok_register_ttk.py cli --driver roxy --roxy-token 你的token --roxy-base http://127.0.0.1:50000
+
+# 不用 CapMonster（纯本地点击 + 扩展）
+python grok_register_ttk.py cli --driver roxy --no-capmonster --count 1
 ```
 
-GUI：驱动选 `roxy`，填 **Roxy Token**（及可选 Workspace ID），勾选「一号一环境」。
+GUI：驱动选 `roxy`，填 **Roxy Token**（及可选 Workspace ID），勾选「一号一环境」。CapMonster 可取消「云解 Turnstile」。
 
-说明：Roxy 提供真实 antidetect 指纹与独立 cookie 环境，**不保证**自动通过 Cloudflare Turnstile；若注册页仍卡验证码，需另接求解器或人工。
+说明：Roxy 提供真实 antidetect 指纹与独立 cookie 环境，**不保证**自动通过 Cloudflare Turnstile；脏 IP 上请开 CapMonster。
 
 ### Cloudflare 邮箱（默认匿名）
 

@@ -47,11 +47,15 @@
   "roxy_proxy_check_channel": "",
   "roxy_profile_name": "grok-register",
   "roxy_api_timeout": 90,
+  "roxy_load_turnstile_extension": true,
+  "roxy_turnstile_extension_path": "",
   "capmonster_api_key": "",
   "capmonster_api_base": "https://api.capmonster.cloud",
   "capmonster_enabled": true,
   "capmonster_timeout": 120,
   "capmonster_poll_interval": 2.0,
   "capmonster_website_key": "",
-  "capmonster_fallback_click": true
+  "capmonster_fallback_click": true,
+  "turnstile_warmup_seconds": 2.0,
+  "turnstile_force_enable_submit": true
 }

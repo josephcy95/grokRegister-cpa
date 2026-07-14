@@ -168,6 +168,11 @@ class RoxyBrowserClient:
         self.workspace_list_method = str(cfg.get("roxy_workspace_list_method") or "GET").upper()
         self.create_payload_extra = dict(cfg.get("roxy_profile_create_payload") or {})
         self.open_extra_params = dict(cfg.get("roxy_open_extra_params") or {})
+        # Load local turnstilePatch on profile create when possible (Roxy field names vary by build).
+        self.load_turnstile_extension = bool(cfg.get("roxy_load_turnstile_extension", True))
+        self.turnstile_extension_path = str(
+            cfg.get("roxy_turnstile_extension_path") or ""
+        ).strip()
 
         self.http = requests.Session()
         if self.token:
@@ -396,6 +401,74 @@ class RoxyBrowserClient:
             errors.append({"method": method, "path": path, "error": "empty items", "payload": payload})
         return {"ok": False, "items": [], "errors": errors}
 
+    def _resolve_turnstile_extension_path(self) -> str:
+        """Absolute path to turnstilePatch/ for Roxy create payload (if present)."""
+        candidates = []
+        if self.turnstile_extension_path:
+            candidates.append(self.turnstile_extension_path)
+        # Prefer path next to this package / repo root
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(here, "turnstilePatch"))
+        # Optional Windows / shared override via env
+        env_p = str(os.environ.get("ROXY_TURNSTILE_EXTENSION_PATH") or "").strip()
+        if env_p:
+            candidates.insert(0, env_p)
+        for p in candidates:
+            ap = os.path.abspath(os.path.expanduser(str(p or "").strip()))
+            if ap and os.path.isdir(ap) and os.path.isfile(
+                os.path.join(ap, "manifest.json")
+            ):
+                return ap
+        return ""
+
+    def _apply_extension_to_create_body(self, body: dict) -> None:
+        """Best-effort inject unpacked extension path into Roxy create payload.
+
+        Roxy builds differ: some accept ``chromeArgs`` / ``args`` with
+        ``--load-extension=...``; others use ``extensionPath`` / ``extensions``.
+        Unknown keys are usually ignored. Prefer packing the CRX in Roxy GUI
+        once if your build does not honour these fields.
+        """
+        if not self.load_turnstile_extension:
+            return
+        # Do not override explicit payload extensions
+        if any(
+            k in body
+            for k in (
+                "extensionPath",
+                "extensionPaths",
+                "extensions",
+                "chromeArgs",
+                "browserArgs",
+                "args",
+            )
+        ):
+            return
+        ext = self._resolve_turnstile_extension_path()
+        if not ext:
+            self._emit(
+                "[Roxy] turnstilePatch 未找到（跳过扩展注入）。"
+                "请确认仓库内 turnstilePatch/ 存在，或设置 roxy_turnstile_extension_path"
+            )
+            return
+        # Dual form: path fields + Chromium load-extension args
+        body.setdefault("extensionPath", ext)
+        body.setdefault("extensionPaths", [ext])
+        body.setdefault("extensions", [ext])
+        load_arg = f"--load-extension={ext}"
+        disable_arg = "--disable-extensions-except=" + ext
+        for key in ("chromeArgs", "browserArgs", "args"):
+            existing = body.get(key)
+            if existing is None:
+                body[key] = [disable_arg, load_arg]
+            elif isinstance(existing, list):
+                for a in (disable_arg, load_arg):
+                    if a not in existing:
+                        existing.append(a)
+            elif isinstance(existing, str) and existing.strip():
+                body[key] = existing + " " + disable_arg + " " + load_arg
+        self._emit(f"[Roxy] turnstilePatch path={ext} (create 注入，若 Roxy 忽略字段则需 GUI 预装)")
+
     def create_profile(self, payload: dict | None = None) -> str:
         self.ensure_token()
         body = dict(self.create_payload_extra)
@@ -423,6 +496,8 @@ class RoxyBrowserClient:
                     self._emit(f"[Roxy] 代理解析失败，跳过: {exc}")
             else:
                 self._emit("[Roxy] roxy_create_use_proxy=true 但 config.proxy 为空")
+
+        self._apply_extension_to_create_body(body)
 
         if payload:
             body.update(payload)
@@ -481,6 +556,20 @@ class RoxyBrowserClient:
         params.setdefault("args", [])
         params.setdefault("forceOpen", True)
         params["headless"] = self.open_headless
+
+        # Also try load-extension on open args (some Roxy builds only honour open.args).
+        if self.load_turnstile_extension:
+            ext = self._resolve_turnstile_extension_path()
+            if ext:
+                args = params.get("args")
+                if not isinstance(args, list):
+                    args = []
+                    params["args"] = args
+                load_arg = f"--load-extension={ext}"
+                disable_arg = "--disable-extensions-except=" + ext
+                for a in (disable_arg, load_arg):
+                    if a not in args:
+                        args.append(a)
 
         path = self.open_path.format(profile_id=pid)
         self._emit(

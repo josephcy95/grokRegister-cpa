@@ -92,6 +92,9 @@ DEFAULT_CONFIG = {
     "roxy_proxy_check_channel": "",
     "roxy_profile_name": "grok-register",
     "roxy_api_timeout": 90,
+    # Try inject turnstilePatch path into Roxy create/open (see turnstilePatch/README.md)
+    "roxy_load_turnstile_extension": True,
+    "roxy_turnstile_extension_path": "",  # default: <repo>/turnstilePatch
     # CapMonster Cloud — Turnstile token solver (https://docs.capmonster.cloud/)
     "capmonster_api_key": "",
     "capmonster_api_base": "https://api.capmonster.cloud",
@@ -102,6 +105,11 @@ DEFAULT_CONFIG = {
     "capmonster_website_key": "",
     # If CapMonster fails, fall back to local checkbox click (usually fails on managed CF)
     "capmonster_fallback_click": True,
+    # No-solver path polish (from grok-register-web / grok_reg_clean)
+    # Warm-up after profile fill so iframe + once-click extension can settle
+    "turnstile_warmup_seconds": 2.0,
+    # If cf-turnstile-response has a long token but Complete stays disabled, force-enable
+    "turnstile_force_enable_submit": True,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -480,9 +488,96 @@ def create_browser_options():
     # base was 1s before, which made wait.doc_loaded give up almost immediately
     # and made element waits flaky. Keep page_load bounded so get() cannot stall.
     options.set_timeouts(base=15, page_load=20, script=30)
-    if os.path.exists(EXTENSION_PATH):
+    # Local Chromium: load once-click Turnstile helper (same as turnstilePatch/).
+    if os.path.isdir(EXTENSION_PATH) and os.path.isfile(
+        os.path.join(EXTENSION_PATH, "manifest.json")
+    ):
         options.add_extension(EXTENSION_PATH)
     return options
+
+
+def _turnstile_warmup_seconds() -> float:
+    try:
+        return max(0.0, float(config.get("turnstile_warmup_seconds", 2.0) or 0.0))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _force_enable_complete_if_token(log_callback=None) -> str:
+    """If CF token is present but Complete stays disabled, force-enable (web-style).
+
+    React may leave the button disabled when the managed widget solves without
+    firing the SPA callback; force-enable only when token length looks real.
+    """
+    global page
+    if page is None:
+        return "no-page"
+    if config.get("turnstile_force_enable_submit", True) is False:
+        return "disabled-by-config"
+    try:
+        result = page.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function buttonText(node) {
+  return [
+    node.innerText, node.textContent, node.getAttribute('value'),
+    node.getAttribute('aria-label'), node.getAttribute('title'),
+  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function isSignupSubmit(node) {
+  const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
+  if (t.includes('goback') || t.includes('go back') || t.includes('返回') || t.includes('戻る')) return false;
+  if (t.includes('email') && !t.includes('complete')) return false;
+  return (
+    t.includes('完成注册') || t.includes('创建账户') || t.includes('创建帐户') ||
+    t.includes('completesignup') || t.includes('completeyoursignup') ||
+    t.includes('complete sign up') || t.includes('createaccount') || t.includes('create account') ||
+    t.includes('登録を完了') || t.includes('登録完了') || t.includes('アカウントを作成') ||
+    (t.includes('sign up') && !t.includes('with')) ||
+    t.includes('submit') || t.includes('continue')
+  );
+}
+const ci = document.querySelector('input[name="cf-turnstile-response"]');
+const token = String((ci && ci.value) || '').trim();
+const hasCF = token.length >= 50;
+const all = Array.from(document.querySelectorAll(
+  'button[type="submit"], button, [role="button"], input[type="submit"]'
+)).filter(isVisible);
+const candidates = all.filter(isSignupSubmit);
+let enabled = candidates.find(n => !n.disabled && n.getAttribute('aria-disabled') !== 'true') || null;
+if (enabled) {
+  enabled.setAttribute('data-grok-complete-signup', '1');
+  return 'already-enabled:' + token.length;
+}
+const anySubmit = candidates[0] || null;
+if (!anySubmit) return 'no-submit-candidate:cf=' + token.length;
+if (!hasCF) return 'no-token-skip-force:cf=' + token.length;
+try {
+  anySubmit.disabled = false;
+  anySubmit.removeAttribute('disabled');
+  anySubmit.setAttribute('aria-disabled', 'false');
+  anySubmit.setAttribute('data-grok-complete-signup', '1');
+  anySubmit.removeAttribute('data-disabled');
+} catch (e) {
+  return 'force-err:' + String(e);
+}
+return 'force-enabled:cf=' + token.length;
+"""
+        )
+        detail = str(result or "unknown")
+        if log_callback and detail.startswith("force-enabled"):
+            log_callback(f"[*] Complete 按钮在 token 就绪后仍禁用 → force-enable ({detail})")
+        return detail
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] force-enable Complete 失败: {exc}")
+        return f"err:{exc}"
 
 
 def _build_request_kwargs(**kwargs):
@@ -5120,7 +5215,7 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=35):
             "（managed Turnstile 通常会 Pengesahan gagal）"
         )
 
-    # --- Local click fallback ---
+    # --- Local click fallback (extension once-click first, then sparse CDP) ---
     timeout_s = max(int(timeout or 35), 5)
     # Don't burn too long on hopeless CDP spam when CapMonster was available
     if capmonster_is_enabled():
@@ -5132,6 +5227,13 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=35):
     attempt = 0
     clicks = 0
     max_clicks = 4  # avoid hammering into "Pengesahan gagal"
+    # Let turnstilePatch (once-click @ ~1.5s) try before we CDP-spam the checkbox.
+    extension_grace = min(3.5, max(1.5, _turnstile_warmup_seconds() + 1.0))
+    if log_callback:
+        log_callback(
+            f"[*] 本地点击路径：先等扩展 once-click ~{extension_grace:.1f}s，"
+            "再稀疏 CDP（最多 4 次）"
+        )
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -5143,6 +5245,13 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=35):
             return token
 
         now = time.time()
+        # Extension grace: only poll token; no Python click yet
+        if now - started < extension_grace:
+            if log_callback and attempt == 1:
+                log_callback("[*] 等待 turnstilePatch 单次自动点击…")
+            sleep_with_cancel(0.5, cancel_callback)
+            continue
+
         if clicks < max_clicks and now - last_click >= 4.5:
             detail = _click_turnstile_widget(log_callback=log_callback)
             last_click = now
@@ -5191,6 +5300,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
+    warmed_up = False
     # Capture turnstile.render callbacks BEFORE the widget mounts on this step.
     _install_turnstile_callback_hook(log_callback=log_callback)
 
@@ -5289,8 +5399,18 @@ return 'filled-no-submit';
                         f"[*] 资料已写入: {given_name} {family_name} — "
                         "停顿几秒观察 Turnstile，不会立刻点 Complete"
                     )
-                # Let CF widget paint after password fill (often 2–6s delayed)
-                sleep_with_cancel(2.5, cancel_callback)
+                # 预热 Turnstile（grok_reg_clean）：给 iframe + once-click 扩展时间初始化
+                warmup = _turnstile_warmup_seconds()
+                if not warmed_up and warmup > 0:
+                    if log_callback:
+                        log_callback(
+                            f"[*] 预热 Turnstile {warmup:.1f}s "
+                            "（扩展单次点击 / 本机 widget 初始化）…"
+                        )
+                    sleep_with_cancel(warmup, cancel_callback)
+                    warmed_up = True
+                # Extra beat so CF widget paints after password fill (often 2–6s delayed)
+                sleep_with_cancel(1.0, cancel_callback)
             elif filled == "fill-failed" and log_callback:
                 log_callback("[Debug] 资料输入失败，重试中...")
                 sleep_with_cancel(0.5, cancel_callback)
@@ -5326,6 +5446,10 @@ return 'filled-no-submit';
                 pass
             sleep_with_cancel(1.2, cancel_callback)
             continue
+
+        # Token ready but button still disabled → force-enable before probe (web-style).
+        if len(_read_turnstile_token()) >= 50:
+            _force_enable_complete_if_token(log_callback=log_callback)
 
         submit_state = page.run_js(
             r"""
@@ -5407,6 +5531,8 @@ return 'ready-for-cdp-submit';
                 )
             # Give React a beat to enable Complete after callback.
             sleep_with_cancel(0.6, cancel_callback)
+            # Web-style: if token is ready but Complete stays disabled, force-enable once.
+            _force_enable_complete_if_token(log_callback=log_callback)
             if log_callback:
                 tok_len = len(_read_turnstile_token() or _LAST_TURNSTILE_TOKEN)
                 log_callback(f"[*] Turnstile OK（token长度={tok_len}）— 现在才点 Complete sign up")
