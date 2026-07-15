@@ -89,14 +89,21 @@ class PlaywrightElement:
             if by_js:
                 self._handle.evaluate("el => el.click()")
             else:
-                self._handle.click(timeout=5000)
+                try:
+                    self._handle.click(timeout=5000, delay=40)
+                except Exception:
+                    # SPA overlays / pointer interception — force trusted-ish path
+                    self._handle.click(timeout=5000, force=True, delay=40)
             return True
         if self._selector:
             loc = self._page._page.locator(self._selector).first
             if by_js:
                 loc.evaluate("el => el.click()")
             else:
-                loc.click(timeout=5000)
+                try:
+                    loc.click(timeout=5000, delay=40)
+                except Exception:
+                    loc.click(timeout=5000, force=True, delay=40)
             return True
         raise RuntimeError("PlaywrightElement has no target")
 
@@ -182,6 +189,7 @@ class PlaywrightTab:
         self._page = page
         self.wait = _WaitProxy(self)
         self.actions = _ActionsProxy(self)
+        self._cdp_session = None
 
     @property
     def url(self) -> str:
@@ -199,12 +207,49 @@ class PlaywrightTab:
 
     def get(self, url: str, timeout: float = 20):
         # Domcontentloaded mirrors local eager load mode.
+        self._cdp_session = None  # navigation may invalidate session
         self._page.goto(
             url,
             wait_until="domcontentloaded",
             timeout=max(float(timeout or 20), 1) * 1000,
         )
         return self
+
+    def _get_cdp_session(self):
+        """Lazy CDPSession for Drission-compatible run_cdp (Input/DOM/Runtime)."""
+        if self._cdp_session is not None:
+            return self._cdp_session
+        ctx = getattr(self._browser, "context", None)
+        if ctx is None:
+            raise RuntimeError("no browser context for CDP")
+        self._cdp_session = ctx.new_cdp_session(self._page)
+        return self._cdp_session
+
+    def run_cdp(self, cmd: str, **kwargs):
+        """DrissionPage-compatible CDP command (required for email CTA / mouse Input)."""
+        params = dict(kwargs) if kwargs else None
+        last_exc = None
+        for attempt in range(2):
+            try:
+                session = self._get_cdp_session()
+                # Playwright CDPSession.send(method, params=None)
+                try:
+                    if params:
+                        return session.send(cmd, params)
+                    return session.send(cmd)
+                except TypeError:
+                    # Older playwright: send(method, **params)
+                    return session.send(cmd, **kwargs) if kwargs else session.send(cmd)
+            except Exception as exc:
+                last_exc = exc
+                # Session often dies after navigation; recreate once
+                self._cdp_session = None
+                if attempt == 0:
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"run_cdp failed: {cmd}")
 
     def run_js(self, script: str, *args):
         body = _rewrite_arguments(script)
@@ -265,7 +310,16 @@ class PlaywrightTab:
 class PlaywrightBrowser:
     """Browser-like object (connect_over_cdp session)."""
 
-    def __init__(self, playwright, browser, context, page, session_info=None, keep_open=False):
+    def __init__(
+        self,
+        playwright,
+        browser,
+        context,
+        page,
+        session_info=None,
+        keep_open=False,
+        driver_name: str = "browser_use",
+    ):
         self._playwright = playwright
         self._browser = browser
         self.context = context
@@ -273,7 +327,7 @@ class PlaywrightBrowser:
         self.session_info = session_info
         self.keep_open = keep_open
         self.user_data_path = None
-        self.driver = "browser_use"
+        self.driver = driver_name or "browser_use"
         self._tabs = [PlaywrightTab(self, page)]
         self.network_events: list[dict] = []
         self._wire_network_hooks(page)
@@ -363,7 +417,15 @@ class PlaywrightBrowser:
         return tab
 
     def quit(self, del_data: bool = True):
-        # Browser Use sessions stop when the websocket disconnects.
+        # Cloud sessions stop when the websocket disconnects; Browserbase also
+        # supports explicit REQUEST_RELEASE.
+        try:
+            client = getattr(self, "_browserbase_client", None)
+            sid = getattr(self, "_browserbase_session_id", None)
+            if client is not None and sid:
+                client.release_session(sid)
+        except Exception:
+            pass
         try:
             if not self.keep_open and self._browser is not None:
                 self._browser.close()

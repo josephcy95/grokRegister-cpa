@@ -56,15 +56,22 @@ DEFAULT_CONFIG = {
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
+    # Stop after this many successes (0 = run full register_count). Campaign: target 10 of 20.
+    "register_success_target": 0,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后自动走授权码流程换 token 并写成 CPA 扁平格式
     "cpa_auto_add": False,
-    "cpa_auth_dir": "",
+    "cpa_auth_dir": "",  # optional extra CPA hot-load dir; empty → only output/runs/<id>/cpa
+    "cpa_mirror_dir": "",  # optional second mirror for xai-*.json
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
-    # Browser driver: local Chromium | Browser Use Cloud | RoxyBrowser fingerprint
-    "browser_driver": "local",  # local | browser_use | roxy
+    # Standardized run output: output/runs/<timestamp>__<driver>__<solver>__<proxy>/
+    "output_root": "output/runs",
+    "output_run_id": "",  # empty = auto; set for multi-worker fixed names
+    "output_run_suffix": "",  # optional tag appended to auto run_id (e.g. w1)
+    # Browser driver: local Chromium | Browser Use Cloud | Browserbase | RoxyBrowser
+    "browser_driver": "local",  # local | browser_use | browserbase | roxy
     "browser_use_api_key": "",
     "browser_use_proxy_country": "us",
     "browser_use_use_proxy": True,
@@ -76,6 +83,19 @@ DEFAULT_CONFIG = {
     "browser_use_screen_width": 0,
     "browser_use_screen_height": 0,
     "browser_use_extra_query": {},
+    # Browserbase Cloud (CDP) — https://docs.browserbase.com/
+    "browserbase_api_key": "",
+    "browserbase_project_id": "",  # optional; inferred from API key if empty
+    "browserbase_api_base": "https://api.browserbase.com/v1",
+    "browserbase_region": "us-west-2",  # us-west-2 | us-east-1 | eu-central-1 | ap-southeast-1
+    "browserbase_use_proxy": False,  # free tier: leave false unless you have proxy quota
+    "browserbase_proxy_country": "",  # ISO alpha-2 e.g. JP / US when use_proxy
+    "browserbase_proxy_city": "",
+    "browserbase_timeout_minutes": 15,  # free max ~15 min/session
+    "browserbase_nav_timeout": 90,
+    "browserbase_keep_open": False,
+    "browserbase_solve_captchas": True,
+    "browserbase_advanced_stealth": False,
     # RoxyBrowser local fingerprint browser (API default http://127.0.0.1:50000)
     "roxy_api_base": "http://127.0.0.1:50000",
     "roxy_api_token": "",
@@ -107,9 +127,21 @@ DEFAULT_CONFIG = {
     "capmonster_fallback_click": True,
     # No-solver path polish (from grok-register-web / grok_reg_clean)
     # Warm-up after profile fill so iframe + once-click extension can settle
-    "turnstile_warmup_seconds": 2.0,
+    "turnstile_warmup_seconds": 4.0,
     # If cf-turnstile-response has a long token but Complete stays disabled, force-enable
     "turnstile_force_enable_submit": True,
+    # Quieter local Turnstile (lesson: click spam resets managed CF; soft-pass needs idle)
+    "turnstile_local_max_clicks": 2,  # Python CDP clicks after extension grace (was 4)
+    "turnstile_local_click_interval": 8.0,  # seconds between local clicks (was ~4.5)
+    "turnstile_local_timeout": 50,  # passive + sparse-click budget when CapMonster off
+    "turnstile_extension_grace_seconds": 5.0,  # wait for turnstilePatch once-click first
+    "turnstile_settle_seconds": 12.0,  # passive watch after profile fill before solve
+    "turnstile_fill_loop_extra_click": False,  # don't re-CDP-click every fill loop iteration
+    # Sign-up entry (dead SPA / inert "Sign up with email" on first paint)
+    "signup_entry_max_reloads": 5,  # hard reload per full-nav cycle
+    "signup_entry_max_full_navs": 3,  # full page.get(SIGNUP_URL) cycles inside click loop
+    "signup_entry_outer_retries": 3,  # whole open_signup_page attempts before fail
+    "signup_entry_timeout": 120,  # seconds for click_email_signup_button
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -121,6 +153,12 @@ class RegistrationCancelled(Exception):
 
 
 class AccountRetryNeeded(Exception):
+    pass
+
+
+class CloudflareBlockedError(Exception):
+    """Hard Cloudflare / WAF block page — fail this slot immediately (consume count, no retry)."""
+
     pass
 
 
@@ -197,10 +235,12 @@ def get_proxies():
 
 
 def get_browser_driver():
-    """Return normalized browser driver: 'local' | 'browser_use' | 'roxy'."""
+    """Return normalized browser driver: 'local' | 'browser_use' | 'browserbase' | 'roxy'."""
     raw = str(config.get("browser_driver", "local") or "local").strip().lower()
     if raw in ("browser_use", "browseruse", "browser-use", "bu", "cloud"):
         return "browser_use"
+    if raw in ("browserbase", "bb", "browser_base", "browser-base"):
+        return "browserbase"
     if raw in ("roxy", "roxybrowser", "roxy_browser", "fingerprint"):
         return "roxy"
     return "local"
@@ -208,6 +248,15 @@ def get_browser_driver():
 
 def is_browser_use_driver():
     return get_browser_driver() == "browser_use"
+
+
+def is_browserbase_driver():
+    return get_browser_driver() == "browserbase"
+
+
+def is_playwright_cloud_driver():
+    """Drivers that use PlaywrightTab over remote CDP (not Drission local)."""
+    return get_browser_driver() in ("browser_use", "browserbase")
 
 
 def is_roxy_driver():
@@ -385,6 +434,7 @@ def build_cpa_export_note():
     driver_label = {
         "roxy": "Roxy",
         "browser_use": "Browser Use",
+        "browserbase": "Browserbase",
         "local": "Local",
     }.get(driver, (driver or "Local").replace("_", " ").title())
 
@@ -400,11 +450,25 @@ def build_cpa_export_note():
 
     proxy = str(config.get("proxy") or "").strip()
     if not proxy and driver == "browser_use" and config.get("browser_use_use_proxy", True):
-        country = str(config.get("browser_use_proxy_country") or "").strip()
-        proxy = f"BrowserUse:{country}" if country else "BrowserUse proxy"
+        country = str(config.get("browser_use_proxy_country") or "").strip().lower()
+        # Explicit proxy wording for CPA notes (campaign requirement)
+        proxy = f"BrowserUse:{country} proxy" if country else "BrowserUse proxy"
+    if not proxy and driver == "browserbase":
+        region = str(config.get("browserbase_region") or "us-west-2").strip()
+        if config.get("browserbase_use_proxy"):
+            country = str(config.get("browserbase_proxy_country") or "").strip().upper()
+            proxy = (
+                f"Browserbase:{country} proxy"
+                if country
+                else f"Browserbase proxy ({region})"
+            )
+        else:
+            proxy = f"Browserbase:{region}"
     if not proxy and driver == "roxy" and config.get("roxy_create_use_proxy"):
         # Roxy may inject profile proxy from config.proxy already covered above
         proxy = str(config.get("proxy") or "").strip()
+        if proxy:
+            proxy = f"proxy:{proxy}" if "proxy" not in proxy.lower() else proxy
     parts.append(proxy if proxy else "No Proxy")
     return " - ".join(parts)
 
@@ -416,23 +480,27 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
     换到 access/refresh token，再写成 CPA 的 xai-<email>.json
     （type=xai + cli-chat-proxy base_url + grok-cli headers）。
 
-    - 本地：写入 cpa_auth_dir，CPA 监听热加载
-    - 远程：POST Management API /v0/management/auth-files（cpa_remote_url + cpa_management_key）
+    Local writes (when cpa_auto_add):
+      - always ``output/runs/<run_id>/cpa/`` when a run is active
+      - plus config ``cpa_auth_dir`` / ``cpa_mirror_dir`` if set (CPA hot-load)
+    Remote: POST Management API when cpa_remote_url + key set.
     """
     if not config.get("cpa_auto_add", False):
         return
-    auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
+    import run_output as _run_out
+
+    write_dirs = _run_out.cpa_write_dirs(config)
     remote_url = str(config.get("cpa_remote_url", "") or "").strip()
     management_key = str(config.get("cpa_management_key", "") or "").strip()
-    if not auth_dir and not remote_url:
-        if log_callback:
-            log_callback("[Debug] 已开启 CPA 直出但未配置 cpa_auth_dir 或 cpa_remote_url，跳过")
-        return
     if remote_url and not management_key:
         if log_callback:
             log_callback("[Debug] 已配置 cpa_remote_url 但未配置 cpa_management_key，跳过远程上传")
         remote_url = ""
-    if not auth_dir and not remote_url:
+    if not write_dirs and not remote_url:
+        if log_callback:
+            log_callback(
+                "[Debug] 已开启 CPA 直出但无本地目录（run cpa / cpa_auth_dir）且无远程，跳过"
+            )
         return
     sso = _normalize_sso_token(raw_token)
     if not sso:
@@ -463,12 +531,12 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
         else:
             _cpa_log("access_token referrer=grok-build OK")
         _cpa_log(f"note={record.get('note')!r}")
-        if auth_dir:
+        for auth_dir in write_dirs:
             try:
                 path = _s2cpa.write_cpa_auth(_s2cpa.Path(auth_dir), record)
                 _cpa_log(f"已写入本地 {path}")
             except Exception as local_exc:
-                _cpa_log(f"本地写入失败: {local_exc}")
+                _cpa_log(f"本地写入失败 ({auth_dir}): {local_exc}")
         if remote_url:
             try:
                 name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record)
@@ -498,9 +566,34 @@ def create_browser_options():
 
 def _turnstile_warmup_seconds() -> float:
     try:
-        return max(0.0, float(config.get("turnstile_warmup_seconds", 2.0) or 0.0))
+        return max(0.0, float(config.get("turnstile_warmup_seconds", 4.0) or 0.0))
     except (TypeError, ValueError):
-        return 2.0
+        return 4.0
+
+
+def _turnstile_local_limits():
+    """Quieter local-click budgets (spam resets managed Turnstile)."""
+    try:
+        max_clicks = max(0, int(config.get("turnstile_local_max_clicks", 2) or 2))
+    except (TypeError, ValueError):
+        max_clicks = 2
+    try:
+        interval = max(3.0, float(config.get("turnstile_local_click_interval", 8.0) or 8.0))
+    except (TypeError, ValueError):
+        interval = 8.0
+    try:
+        local_timeout = max(15, int(config.get("turnstile_local_timeout", 50) or 50))
+    except (TypeError, ValueError):
+        local_timeout = 50
+    try:
+        grace = max(1.5, float(config.get("turnstile_extension_grace_seconds", 5.0) or 5.0))
+    except (TypeError, ValueError):
+        grace = 5.0
+    try:
+        settle = max(3.0, float(config.get("turnstile_settle_seconds", 12.0) or 12.0))
+    except (TypeError, ValueError):
+        settle = 12.0
+    return max_clicks, interval, local_timeout, grace, settle
 
 
 def _force_enable_complete_if_token(log_callback=None) -> str:
@@ -1310,6 +1403,386 @@ def is_cloudflare_block_response(res):
         return False
 
 
+# ---------------------------------------------------------------------------
+# Multi-language Cloudflare hard-block detection (not Turnstile widget)
+# ---------------------------------------------------------------------------
+# Hard block / interstitial replaces the whole page (no email CTA). Turnstile on
+# the real signup form is a different path and must NOT match here.
+_CF_BLOCK_TITLE_MARKERS = (
+    "attention required",
+    "access denied",
+    "just a moment",
+    "one more step",
+    "please wait",
+    "checking your browser",
+    "security check",
+    "blocked",
+    # JP / CN / KR / DE / FR / ES / PT / RU / TH / ID / VI / AR / …
+    "注意が必要",
+    "アクセスが拒否",
+    "アクセス拒否",
+    "しばらくお待ち",
+    "ブラウザを確認",
+    "访问被拒绝",
+    "拒絕存取",
+    "拒绝访问",
+    "请稍候",
+    "請稍候",
+    "正在检查您的浏览器",
+    "正在檢查您的瀏覽器",
+    "액세스 거부",
+    "잠시만 기다리",
+    "브라우저 확인",
+    "Zugriff verweigert",
+    "Zugriff abgelehnt",
+    "Einen Moment",
+    "Bitte warten",
+    "Accès refusé",
+    "Un instant",
+    "Veuillez patienter",
+    "Acceso denegado",
+    "Un momento",
+    "Acesso negado",
+    "Aguarde",
+    "Доступ запрещён",
+    "Доступ запрещен",
+    "Подождите",
+    "ปฏิเสธการเข้าถึง",
+    "โปรดรอ",
+    "Truy cập bị từ chối",
+    "Vui lòng chờ",
+    "Akses ditolak",
+    "Harap tunggu",
+    "تم رفض الوصول",
+    "لحظة من فضلك",
+)
+
+# Strong body phrases (need at least one + missing signup CTA, or two weak signals).
+_CF_BLOCK_BODY_STRONG = (
+    "sorry, you have been blocked",
+    "you have been blocked",
+    "you are unable to access",
+    "access denied",
+    "click to reveal",
+    "cloudflare ray id",
+    "cf-ray",
+    "error code 1020",
+    "error 1020",
+    "error code 1015",
+    "error code 1009",
+    "error code 1010",
+    "why have i been blocked",
+    "the owner of this website",
+    "performance & security by cloudflare",
+    "enable javascript and cookies",
+    "checking if the site connection is secure",
+    "needs to review the security of your connection",
+    "this website is using a security service",
+    "ray id",
+    # Localized hard-block copy
+    "您已被封锁",
+    "您已被封鎖",
+    "访问被拒绝",
+    "拒絕存取",
+    "为什么我会被封锁",
+    "為什麼我會被封鎖",
+    "此网站使用安全服务",
+    "此網站使用安全服務",
+    "单击以显示",
+    "按一下以顯示",
+    "点击显示",
+    "アクセスがブロック",
+    "ブロックされました",
+    "このウェブサイトの所有者",
+    "セキュリティ サービス",
+    "セキュリティサービス",
+    "クリックして表示",
+    "차단되었습니다",
+    "액세스가 거부",
+    "보안 서비스",
+    "Sie wurden blockiert",
+    "Zugriff verweigert",
+    "Sicherheitsdienst",
+    "vous avez été bloqué",
+    "accès refusé",
+    "service de sécurité",
+    "ha sido bloqueado",
+    "acceso denegado",
+    "você foi bloqueado",
+    "acesso negado",
+    "вы были заблокированы",
+    "доступ запрещ",
+    "คุณถูกบล็อก",
+    "การเข้าถึงถูกปฏิเสธ",
+    "bạn đã bị chặn",
+    "truy cập bị từ chối",
+    "anda telah diblokir",
+    "akses ditolak",
+    "تم حظرك",
+    "تم رفض الوصول",
+)
+
+_CF_BLOCK_DOM_SELECTORS = (
+    "#cf-error-details",
+    "#cf-wrapper",
+    ".cf-error-title",
+    ".cf-error-description",
+    ".cf-error-footer",
+    "#challenge-error-text",
+    "#challenge-running",
+    "#challenge-stage",
+    ".cf-browser-verification",
+    "#cf-challenge-running",
+    "div.cf-section",
+    "#trk_jschal_js",
+)
+
+# Signup still reachable if any of these appear (multi-language).
+_SIGNUP_ALIVE_MARKERS = (
+    "sign up with email",
+    "sign up with google",
+    "sign up with apple",
+    "sign up with x",
+    "continue with email",
+    "create your account",
+    "create your grok account",
+    "complete sign up",
+    "already have an account",
+    "メールで登録",
+    "メールアドレスで登録",
+    "アカウントを作成",
+    "登録を完了",
+    "使用邮箱注册",
+    "用邮箱注册",
+    "使用邮箱",
+    "使用 google 注册",
+    "使用 apple 注册",
+    "创建您的账户",
+    "创建您的帳戶",
+    "创建您的 grok",
+    "已有账户",
+    "已有帳戶",
+    "mit e-mail registrieren",
+    "mit email registrieren",
+    "erstellen sie ihr",
+    "s'inscrire avec e-mail",
+    "s'inscrire avec email",
+    "registrarse con correo",
+    "inscrever-se com e-mail",
+    "이메일로 가입",
+    "이메일로 계속",
+    "สมัครด้วยอีเมล",
+    "đăng ký bằng email",
+    "daftar dengan email",
+    " التسجيل بالبريد",
+)
+
+
+def _page_text_blob_for_block_check() -> dict:
+    """Best-effort title/body/url snapshot for block classification."""
+    global page
+    out = {"url": "", "title": "", "body": "", "html_head": ""}
+    if page is None:
+        return out
+    try:
+        out["url"] = str(page.url or "")
+    except Exception:
+        pass
+    try:
+        out["title"] = str(page.title or "")
+    except Exception:
+        try:
+            out["title"] = str(page.run_js("return document.title || '';") or "")
+        except Exception:
+            pass
+    try:
+        snap = page.run_js(
+            r"""
+const body = (document.body && (document.body.innerText || document.body.textContent) || '')
+  .replace(/\s+/g, ' ').trim().slice(0, 2500);
+const html = (document.documentElement && document.documentElement.outerHTML || '')
+  .slice(0, 4000);
+const domHits = [];
+const sels = [
+  '#cf-error-details','#cf-wrapper','.cf-error-title','.cf-error-description',
+  '#challenge-error-text','#challenge-running','#challenge-stage',
+  '.cf-browser-verification','#cf-challenge-running','#trk_jschal_js'
+];
+for (const s of sels) {
+  try { if (document.querySelector(s)) domHits.push(s); } catch (e) {}
+}
+// iframe challenges that replace the whole tab (not compact Turnstile on form)
+const bigCfIframes = Array.from(document.querySelectorAll('iframe')).filter((f) => {
+  const src = String(f.src || '');
+  if (!/challenges\.cloudflare|cdn-cgi\/challenge|turnstile/i.test(src)) return false;
+  const r = f.getBoundingClientRect();
+  return r.width >= 280 && r.height >= 200;
+}).length;
+return {
+  body,
+  htmlHead: html.slice(0, 2500),
+  domHits,
+  bigCfIframes,
+  hasEmailCta: !!Array.from(document.querySelectorAll('button,a,[role="button"]')).find((n) => {
+    const t = ((n.innerText||n.textContent||'') + ' ' + (n.getAttribute('aria-label')||'')).toLowerCase();
+    return /email|e-mail|mail|邮箱|郵件|メール|이메일|correo|courriel|e-mail/.test(t)
+      && /sign|register|登録|注册|註冊|가입|continu|inscri|anmeld|daftar|สมัคร|đăng/.test(t);
+  }),
+  hasEmailInput: !!document.querySelector(
+    'input[type="email"], input[name="email"], input[data-testid="email"], input[autocomplete="email"]'
+  ),
+  hasProfile: !!document.querySelector(
+    'input[name="givenName"], input[data-testid="givenName"], input[name="password"], input[type="password"]'
+  ),
+  hasCfTurnstileField: !!document.querySelector(
+    'input[name="cf-turnstile-response"], input[id*="cf-chl-widget"]'
+  ),
+};
+            """
+        )
+        if isinstance(snap, dict):
+            out["body"] = str(snap.get("body") or "")
+            out["html_head"] = str(snap.get("htmlHead") or "")
+            out["dom_hits"] = list(snap.get("domHits") or [])
+            out["big_cf_iframes"] = int(snap.get("bigCfIframes") or 0)
+            out["has_email_cta"] = bool(snap.get("hasEmailCta"))
+            out["has_email_input"] = bool(snap.get("hasEmailInput"))
+            out["has_profile"] = bool(snap.get("hasProfile"))
+            out["has_cf_turnstile_field"] = bool(snap.get("hasCfTurnstileField"))
+    except Exception:
+        try:
+            raw = page.html or ""
+            out["html_head"] = str(raw)[:2500]
+            out["body"] = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(raw)))[:2500]
+        except Exception:
+            pass
+    return out
+
+
+def classify_cloudflare_page_block(snapshot: dict | None = None) -> dict:
+    """
+    Classify whether the current page is a hard Cloudflare / WAF block.
+
+    Returns dict: {blocked: bool, kind: str, reason: str, score: int}
+    Does NOT treat normal signup Turnstile (cf-turnstile-response on form) as blocked.
+    """
+    snap = snapshot if isinstance(snapshot, dict) else _page_text_blob_for_block_check()
+    title = str(snap.get("title") or "")
+    body = str(snap.get("body") or "")
+    html = str(snap.get("html_head") or "")
+    url = str(snap.get("url") or "")
+    blob = f"{title}\n{body}\n{html}".lower()
+    title_l = title.lower()
+
+    # Real signup still usable → not a hard block (even if CF word appears in footer).
+    alive_blob = f"{title}\n{body}".lower()
+    if snap.get("has_email_input") or snap.get("has_profile") or snap.get("has_cf_turnstile_field"):
+        return {
+            "blocked": False,
+            "kind": "signup_form",
+            "reason": "signup_fields_present",
+            "score": 0,
+            "url": url,
+            "title": title[:120],
+        }
+    if snap.get("has_email_cta"):
+        return {
+            "blocked": False,
+            "kind": "signup_cta",
+            "reason": "email_signup_cta_present",
+            "score": 0,
+            "url": url,
+            "title": title[:120],
+        }
+    if any(m in alive_blob for m in _SIGNUP_ALIVE_MARKERS):
+        return {
+            "blocked": False,
+            "kind": "signup_markers",
+            "reason": "localized_signup_copy",
+            "score": 0,
+            "url": url,
+            "title": title[:120],
+        }
+
+    score = 0
+    hits: list[str] = []
+
+    for m in _CF_BLOCK_TITLE_MARKERS:
+        if m.lower() in title_l or m in title:
+            score += 4
+            hits.append(f"title:{m[:40]}")
+            break
+
+    strong_hits = 0
+    for m in _CF_BLOCK_BODY_STRONG:
+        if m.lower() in blob or m in body or m in html:
+            strong_hits += 1
+            score += 3
+            hits.append(f"body:{m[:40]}")
+            if strong_hits >= 3:
+                break
+
+    dom_hits = snap.get("dom_hits") or []
+    if dom_hits:
+        score += 3 + min(3, len(dom_hits))
+        hits.append(f"dom:{','.join(str(x) for x in dom_hits[:4])}")
+
+    if int(snap.get("big_cf_iframes") or 0) > 0 and not snap.get("has_email_cta"):
+        score += 3
+        hits.append("big_cf_iframe")
+
+    # Classic CF interstitial titles without signup chrome
+    if re.search(r"attention\s+required|access\s+denied|just\s+a\s+moment", title_l):
+        score += 3
+        hits.append("title_re")
+
+    if "cdn-cgi/challenge-platform" in blob or "challenges.cloudflare.com" in blob:
+        if not snap.get("has_cf_turnstile_field"):
+            score += 2
+            hits.append("cf_challenge_url")
+
+    # Ray ID + cloudflare branding without signup = hard block
+    if ("ray id" in blob or "cf-ray" in blob) and "cloudflare" in blob:
+        score += 3
+        hits.append("ray+cloudflare")
+
+    blocked = score >= 6
+    kind = "cf_hard_block" if blocked else "clear_or_unknown"
+    if blocked and ("just a moment" in title_l or "checking" in blob[:400]):
+        kind = "cf_interstitial"
+    return {
+        "blocked": blocked,
+        "kind": kind,
+        "reason": "; ".join(hits[:8]) if hits else "no_signal",
+        "score": score,
+        "url": url,
+        "title": title[:120],
+    }
+
+
+def raise_if_cloudflare_blocked(log_callback=None, *, context: str = ""):
+    """
+    If current page is an obvious multi-language CF block, raise CloudflareBlockedError.
+
+    Caller should treat this as a terminal failure for the current --count slot
+    (no AccountRetryNeeded loop).
+    """
+    snap = _page_text_blob_for_block_check()
+    result = classify_cloudflare_page_block(snap)
+    if not result.get("blocked"):
+        return result
+    where = f" @ {context}" if context else ""
+    title = result.get("title") or ""
+    reason = result.get("reason") or ""
+    msg = (
+        f"Cloudflare 拦截页{where}: kind={result.get('kind')} "
+        f"score={result.get('score')} title={title!r} ({reason})"
+    )
+    if log_callback:
+        log_callback(f"[!] {msg} — 跳过本槽位（计入 --count，不重试）")
+    raise CloudflareBlockedError(msg)
+
+
 def set_birth_date(session, log_callback=None):
     url = "https://grok.com/rest/auth/set-birth-date"
     new_headers = {
@@ -1574,6 +2047,20 @@ def start_browser(log_callback=None):
                 browser = connect_browser_use(config, log_callback=log_callback)
                 tabs = browser.get_tabs()
                 page = tabs[-1] if tabs else browser.new_tab()
+            elif driver == "browserbase":
+                from browserbase_adapter import connect_browserbase
+
+                if log_callback and attempt == 1:
+                    region = str(config.get("browserbase_region") or "us-west-2")
+                    use_proxy = bool(config.get("browserbase_use_proxy", False))
+                    country = str(config.get("browserbase_proxy_country") or "").strip() or "-"
+                    log_callback(
+                        f"[*] 浏览器驱动: Browserbase | region={region} | "
+                        f"use_proxy={use_proxy} | proxy_country={country}"
+                    )
+                browser = connect_browserbase(config, log_callback=log_callback)
+                tabs = browser.get_tabs()
+                page = tabs[-1] if tabs else browser.new_tab()
             elif driver == "roxy":
                 from roxy_adapter import connect_roxy
 
@@ -1807,8 +2294,9 @@ const scored = Array.from(document.querySelectorAll('input, textarea')).filter((
   ].filter(Boolean).join(' ').toLowerCase();
   return (
     meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') ||
-    meta.includes('邮箱') || meta.includes('郵件') || meta.includes('メール') ||
-    meta.includes('이메일') || meta.includes('correo')
+    meta.includes('邮箱') || meta.includes('郵件') || meta.includes('電郵') || meta.includes('邮件') ||
+    meta.includes('メール') || meta.includes('이메일') || meta.includes('correo') ||
+    meta.includes('courriel') || meta.includes('почт') || meta.includes('อีเมล')
   );
 });
 const input = [...direct, ...scored].find((node) => isVisible(node) && !node.disabled && !node.readOnly);
@@ -1821,30 +2309,57 @@ return !!input;
 
 
 # Email-signup CTA phrases across locales (x.ai / Browser Use geo often localizes UI).
-# JP proxy → 「メールで登録」; CN → 「使用邮箱注册」; EN → 「Sign up with email」.
+# EN / JP / CN / TW / KR / DE / FR / ES / PT / TH / VI / ID / RU / AR / …
 _EMAIL_SIGNUP_TEXT_SELECTORS = (
     "text:Sign up with email",
     "text:Sign up with Email",
     "text:Continue with email",
     "text:Use email",
+    "text:Register with email",
     "text:使用邮箱注册",
     "text:用邮箱注册",
     "text:邮箱注册",
+    "text:使用電郵註冊",
+    "text:使用电邮注册",
+    "text:電郵註冊",
+    "text:使用邮箱註冊",
     "text:メールで登録",
     "text:メールアドレスで登録",
     "text:メールで続行",
     "text:이메일로 가입",
     "text:이메일로 계속",
+    "text:이메일로 등록",
     "text:Registrarse con correo",
+    "text:Registrarse con email",
+    "text:Regístrate con el correo",
     "text:S'inscrire avec e-mail",
+    "text:S'inscrire avec email",
+    "text:Continuer avec e-mail",
     "text:Mit E-Mail registrieren",
+    "text:Mit Email registrieren",
+    "text:Mit E-Mail fortfahren",
+    "text:Inscrever-se com e-mail",
+    "text:Inscrever-se com email",
+    "text:Cadastrar com e-mail",
+    "text:Registrati con e-mail",
+    "text:Aanmelden met e-mail",
+    "text:Регистрация через email",
+    "text:Зарегистрироваться с email",
+    "text:สมัครด้วยอีเมล",
+    "text:ลงทะเบียนด้วยอีเมล",
+    "text:Đăng ký bằng email",
+    "text:Daftar dengan email",
+    "text:Daftar lewat email",
     "xpath://button[contains(normalize-space(.), 'Sign up with email')]",
     "xpath://button[contains(normalize-space(.), '使用邮箱')]",
+    "xpath://button[contains(normalize-space(.), '使用電郵')]",
     "xpath://button[contains(normalize-space(.), 'メールで登録')]",
     "xpath://button[contains(normalize-space(.), 'メール')]",
+    "xpath://button[contains(normalize-space(.), 'Mit E-Mail')]",
+    "xpath://button[contains(normalize-space(.), '이메일')]",
     "xpath://*[@role='button' and contains(normalize-space(.), 'メールで登録')]",
     "xpath://*[@role='button' and contains(normalize-space(.), 'Sign up with email')]",
-    "xpath://button[contains(translate(., 'EMAIL', 'email'), 'email') and (contains(translate(., 'SIGN', 'sign'), 'sign') or contains(translate(., 'CONTINUE', 'continue'), 'continue'))]",
+    "xpath://button[contains(translate(., 'EMAIL', 'email'), 'email') and (contains(translate(., 'SIGN', 'sign'), 'sign') or contains(translate(., 'CONTINUE', 'continue'), 'continue') or contains(translate(., 'REGISTER', 'register'), 'register'))]",
 )
 
 # JS: score visible buttons for "sign up / continue with email" regardless of locale.
@@ -1868,12 +2383,14 @@ function textOf(node) {
 }
 // Prefer email/mail CTAs; exclude Apple / Google / X / login-only rows.
 const mailHints = [
-  'email', 'e-mail', 'mail', '邮箱', '郵件', '邮件', '電子郵件',
-  'メール', 'メールアドレス', '이메일', 'correo', 'e-mail', 'courriel'
+  'email', 'e-mail', 'mail', '邮箱', '郵件', '邮件', '電子郵件', '電郵', '电邮',
+  'メール', 'メールアドレス', '이메일', 'correo', 'courriel', 'e-mailadres',
+  'почт', 'อีเมล', 'email', 'e-posta'
 ];
 const signupHints = [
   'sign up', 'signup', 'register', 'continue', 'create', 'use',
-  '注册', '註冊', '登録', '가입', 'registr', 'inscri', 'anmeld', 'contin'
+  '注册', '註冊', '登録', '가입', 'registr', 'inscri', 'anmeld', 'contin',
+  'cadastr', 'daftar', 'สมัคร', 'đăng ký', 'зарегистр', 'fortfahr'
 ];
 const excludeHints = [
   'apple', 'google', 'github', 'facebook', 'microsoft', 'twitter',
@@ -1882,7 +2399,8 @@ const excludeHints = [
 const providerExclude = [
   'apple', 'google', 'x で', 'xで', 'with x', 'with twitter', 'with apple', 'with google',
   'apple で', 'google で', 'github', 'facebook',
-  'appleで', 'googleで'
+  'appleで', 'googleで', 'mit x', 'mit apple', 'mit google',
+  'avec x', 'avec apple', 'avec google', 'con x', 'con apple', 'con google'
 ];
 const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'))
   .filter((n) => isVisible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true');
@@ -1899,13 +2417,19 @@ for (const node of nodes) {
   const hasSignup = signupHints.some((h) => t.includes(h.toLowerCase()) || raw.includes(h));
   if (hasMail) score += 5;
   if (hasSignup) score += 2;
-  // Exact-ish JP/EN/CN labels
+  // Exact-ish labels (EN / JP / CN / TW / KR / DE / FR / ES / …)
   if (raw.includes('メールで登録') || raw.includes('メールアドレスで登録')) score += 10;
-  if (t.includes('sign up with email') || t.includes('continue with email')) score += 10;
-  if (raw.includes('使用邮箱') || raw.includes('用邮箱注册')) score += 10;
+  if (t.includes('sign up with email') || t.includes('continue with email') || t.includes('register with email')) score += 10;
+  if (raw.includes('使用邮箱') || raw.includes('用邮箱注册') || raw.includes('使用電郵') || raw.includes('使用电邮')) score += 10;
+  if (raw.includes('이메일로 가입') || raw.includes('이메일로 계속')) score += 10;
+  if (t.includes('mit e-mail registrieren') || t.includes('mit email registrieren')) score += 10;
+  if (t.includes("s'inscrire avec") && t.includes('mail')) score += 10;
+  if (t.includes('registrarse con correo') || t.includes('registrarse con email')) score += 10;
+  if (t.includes('inscrever-se com') && t.includes('mail')) score += 10;
+  if (raw.includes('สมัครด้วยอีเมล') || raw.includes('Đăng ký bằng email') || raw.includes('Daftar dengan email')) score += 10;
   if (providerExclude.some((h) => t.includes(h) || raw.includes(h))) score -= 20;
   // Pure "login" without mail
-  if ((t.includes('login') || raw.includes('ログイン') || raw.includes('登录')) && !hasMail) score -= 8;
+  if ((t.includes('login') || raw.includes('ログイン') || raw.includes('登录') || raw.includes('登入') || raw.includes('anmelden') || raw.includes('connexion')) && !hasMail) score -= 8;
   // Prefer leaf/smaller controls when scores tie (avoids wrapping div with doubled text)
   const r = node.getBoundingClientRect();
   const area = Math.max(1, r.width * r.height);
@@ -1984,13 +2508,38 @@ def _find_email_signup_element():
             except Exception:
                 continue
             low = text.lower()
-            if any(x in text for x in ("メールで登録", "メールアドレスで登録", "使用邮箱", "用邮箱")):
+            if any(
+                x in text
+                for x in (
+                    "メールで登録",
+                    "メールアドレスで登録",
+                    "使用邮箱",
+                    "用邮箱",
+                    "使用電郵",
+                    "사용 邮箱",
+                    "이메일로",
+                    "Mit E-Mail",
+                    "Mit Email",
+                    "S'inscrire avec",
+                    "Registrarse con",
+                    "Inscrever-se com",
+                    "สมัครด้วยอีเมล",
+                    "Đăng ký bằng email",
+                    "Daftar dengan email",
+                )
+            ):
                 return ele
-            if "email" in low and any(x in low for x in ("sign", "continue", "use", "register")):
+            if "email" in low and any(
+                x in low for x in ("sign", "continue", "use", "register", "inscri", "cadastr", "anmeld")
+            ):
                 return ele
-            if "邮箱" in text and ("注册" in text or "註冊" in text or "注册" in text):
+            if ("邮箱" in text or "郵件" in text or "電郵" in text) and (
+                "注册" in text or "註冊" in text or "注册" in text
+            ):
                 return ele
             if "メール" in text and ("登録" in text or "続行" in text):
+                return ele
+            if "이메일" in text and ("가입" in text or "계속" in text or "등록" in text):
                 return ele
     except Exception:
         pass
@@ -2057,11 +2606,35 @@ def _detach_playwright_cdp():
 
 def _attach_playwright_cdp(log_callback=None):
     """
-    Attach Playwright to the same Chromium Roxy already opened.
-    Playwright's mouse/keyboard goes through CDP Input with full event fidelity
-    (isTrusted path sites expect) — better than hand-rolled dispatchMouseEvent.
+    Attach Playwright to the same Chromium already opened (Roxy debugger or
+    Browser Use PlaywrightTab). Mouse/keyboard go through CDP Input with full
+    event fidelity — better than hand-rolled dispatchMouseEvent alone.
     """
-    global _pw_runtime, page
+    global _pw_runtime, page, browser
+
+    # Browser Use: page is already a PlaywrightTab wrapping a live PW Page.
+    try:
+        from browser_use_adapter import PlaywrightTab as _BuTab
+    except Exception:
+        _BuTab = None
+    if page is not None and _BuTab is not None and isinstance(page, _BuTab):
+        try:
+            return page._page
+        except Exception:
+            pass
+    # Also: cloud Playwright drivers (Browser Use / Browserbase)
+    if browser is not None and getattr(browser, "driver", None) in (
+        "browser_use",
+        "browserbase",
+    ):
+        try:
+            tab = browser.get_tab(0) if page is None else page
+            inner = getattr(tab, "_page", None)
+            if inner is not None:
+                return inner
+        except Exception:
+            pass
+
     endpoint = _roxy_cdp_http_endpoint()
     if not endpoint:
         return None
@@ -2493,18 +3066,26 @@ const buttons = Array.from(document.querySelectorAll(
 )).filter((n) => isVisible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true');
 const submitBtn = buttons.find((node) => {
   const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
+  const raw = buttonText(node);
   if (t.includes('email') && !t.includes('complete')) return false;
-  if (t.includes('goback') || t.includes('go back') || t.includes('返回') || t.includes('戻る')) return false;
+  if (t.includes('goback') || t.includes('go back') || t.includes('返回') || t.includes('戻る') || t.includes('뒤로') || t.includes('zurück') || t.includes('retour') || t.includes('atrás') || t.includes('voltar')) return false;
   return (
     t.includes('completesignup') || t.includes('completeyoursignup') ||
     t.includes('complete sign up') || t.includes('createaccount') ||
     t.includes('create account') || t.includes('createyouraccount') ||
-    t.includes('完成注册') || t.includes('创建账户') || t.includes('创建帐户') ||
+    t.includes('完成注册') || t.includes('完成註冊') || t.includes('创建账户') || t.includes('创建帐户') || t.includes('建立帳戶') ||
     t.includes('登録を完了') || t.includes('登録完了') || t.includes('アカウントを作成') ||
-    t.includes('登録する') ||
+    t.includes('登録する') || t.includes('가입완료') || t.includes('가입 완료') || t.includes('계정만들기') ||
+    t.includes('registrierungabschließen') || t.includes('kontoerstellen') ||
+    t.includes("terminerl'inscription") || t.includes('créeruncompte') ||
+    t.includes('completarregistro') || t.includes('crearcuenta') ||
+    t.includes('concluircadastro') || t.includes('criaconta') ||
     (t.includes('sign up') && !t.includes('with')) ||
     t.includes('submit') || t.includes('continue') || t.includes('next') ||
-    t.includes('続行') || t.includes('続ける') || t.includes('完了')
+    t.includes('続行') || t.includes('続ける') || t.includes('完了') ||
+    t.includes('fortfahren') || t.includes('weiter') || t.includes('continuer') ||
+    t.includes('continuar') || t.includes('siguiente') || t.includes('próximo') ||
+    raw.includes('등록을 완료') || raw.includes('Registrierung abschließen')
   );
 }) || buttons.find((node) => node.getAttribute('type') === 'submit');
 if (!submitBtn) return null;
@@ -2538,9 +3119,22 @@ def _cdp_click_complete_signup(log_callback=None):
                 "Create account",
                 "Create your account",
                 "完成注册",
+                "完成註冊",
                 "创建账户",
+                "创建帐户",
+                "建立帳戶",
                 "登録を完了",
                 "アカウントを作成",
+                "가입 완료",
+                "계정 만들기",
+                "Registrierung abschließen",
+                "Konto erstellen",
+                "Terminer l'inscription",
+                "Créer un compte",
+                "Completar registro",
+                "Crear cuenta",
+                "Concluir cadastro",
+                "Criar conta",
             ],
             log_callback=log_callback,
         )
@@ -2689,10 +3283,22 @@ def _native_click_email_signup(log_callback=None):
         "Sign up with email",
         "Continue with email",
         "Use email",
+        "Register with email",
         "メールで登録",
         "メールアドレスで登録",
         "使用邮箱注册",
         "用邮箱注册",
+        "使用電郵註冊",
+        "이메일로 가입",
+        "이메일로 계속",
+        "Mit E-Mail registrieren",
+        "Mit Email registrieren",
+        "S'inscrire avec e-mail",
+        "Registrarse con correo",
+        "Inscrever-se com e-mail",
+        "สมัครด้วยอีเมล",
+        "Đăng ký bằng email",
+        "Daftar dengan email",
     )
 
     def try_playwright_role():
@@ -2757,9 +3363,11 @@ def _native_click_email_signup(log_callback=None):
     def try_marked_js():
         return page.run_js(_CLICK_MARKED_EMAIL_SIGNUP_JS)
 
-    # Keep the first pass short — if SPA is dead, refresh beats 10 click strategies.
+    # Browser Use / Playwright: prefer native element click + mouse before CDP.
+    # Roxy/Drission: CDP Input after PW attach.
     ordered = [
         ("pw-role", try_playwright_role),
+        ("pw-sel", try_playwright_selector),
         ("cdp", try_cdp_coords),
         ("userGesture", try_user_gesture),
     ]
@@ -2819,8 +3427,11 @@ function isVisible(node) {
 }
 const btn = Array.from(document.querySelectorAll('button,a,[role="button"]'))
   .filter(isVisible)
-  .find((n) => /sign up with email|メールで登録|使用邮箱|continue with email/i
-    .test((n.innerText||n.textContent||'') + ' ' + (n.getAttribute('aria-label')||'')));
+  .find((n) => {
+    const t = ((n.innerText||n.textContent||'') + ' ' + (n.getAttribute('aria-label')||''));
+    return /sign up with email|continue with email|register with email|メールで登録|使用邮箱|使用電郵|이메일로|mit e-mail|s'inscrire avec|registrarse con correo|inscrever-se com|สมัครด้วยอีเมล|đăng ký bằng email|daftar dengan email/i
+      .test(t);
+  });
 return {
   ready: document.readyState,
   hasCta: !!btn,
@@ -2891,9 +3502,11 @@ def _reload_signup_page(log_callback=None, cancel_callback=None, reason=""):
         _cdp_activate_page()
     except Exception:
         pass
+    raise_if_cloudflare_blocked(log_callback, context="signup-reload")
     _wait_signup_cta_ready(timeout=8, cancel_callback=cancel_callback)
     # Short beat after CTA paint — don't over-wait; dead pages need another reload not sleep
     sleep_with_cancel(0.8, cancel_callback)
+    raise_if_cloudflare_blocked(log_callback, context="signup-reload-after-wait")
     if log_callback:
         try:
             ready = page.run_js("return document.readyState;")
@@ -2902,8 +3515,89 @@ def _reload_signup_page(log_callback=None, cancel_callback=None, reason=""):
         log_callback(f"[*] 刷新后 URL: {page.url} readyState={ready}")
 
 
-def click_email_signup_button(timeout=60, log_callback=None, cancel_callback=None):
-    """Click email signup and only return after the email input is visible."""
+def _signup_entry_limits():
+    """Reload / full-nav / outer-retry budgets for dead SPA email CTA."""
+    try:
+        max_reloads = max(1, int(config.get("signup_entry_max_reloads", 5) or 5))
+    except (TypeError, ValueError):
+        max_reloads = 5
+    try:
+        max_full_navs = max(0, int(config.get("signup_entry_max_full_navs", 3) or 3))
+    except (TypeError, ValueError):
+        max_full_navs = 3
+    try:
+        outer = max(1, int(config.get("signup_entry_outer_retries", 3) or 3))
+    except (TypeError, ValueError):
+        outer = 3
+    try:
+        timeout = max(30, int(config.get("signup_entry_timeout", 120) or 120))
+    except (TypeError, ValueError):
+        timeout = 120
+    return max_reloads, max_full_navs, outer, timeout
+
+
+def _full_navigate_signup(log_callback=None, cancel_callback=None, reason=""):
+    """Navigate to SIGNUP_URL fresh (stronger than Page.reload)."""
+    global page, browser
+    if page is None and browser is not None:
+        try:
+            page = browser.get_tab(0)
+        except Exception:
+            page = None
+    if page is None:
+        raise RuntimeError("no page for signup full navigate")
+    if log_callback:
+        msg = "[*] 重新打开注册页（完整导航）"
+        if reason:
+            msg += f"（{reason}）"
+        log_callback(msg)
+    try:
+        page.get(SIGNUP_URL, timeout=45)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] full navigate 异常: {exc}")
+        try:
+            page = browser.new_tab(SIGNUP_URL)
+        except Exception:
+            raise
+    try:
+        page.wait.doc_loaded(timeout=12, raise_err=False)
+    except Exception:
+        pass
+    try:
+        _cdp_activate_page()
+    except Exception:
+        pass
+    raise_if_cloudflare_blocked(log_callback, context="signup-full-nav")
+    _wait_signup_cta_ready(timeout=10, cancel_callback=cancel_callback)
+    sleep_with_cancel(1.0, cancel_callback)
+    raise_if_cloudflare_blocked(log_callback, context="signup-full-nav-after-wait")
+    try:
+        _install_turnstile_callback_hook(log_callback=log_callback)
+    except Exception:
+        pass
+    if log_callback:
+        try:
+            ready = page.run_js("return document.readyState;")
+        except Exception:
+            ready = "?"
+        log_callback(f"[*] 完整导航后 URL: {page.url} readyState={ready}")
+
+
+def click_email_signup_button(timeout=None, log_callback=None, cancel_callback=None):
+    """Click email signup and only return after the email input is visible.
+
+    Dead first-paint SPA (common on Roxy): click strategies fail until hard
+    reload / full re-navigation rehydrates handlers. Budget:
+
+      - hard reload up to ``signup_entry_max_reloads`` (default 5) per full-nav
+      - then full ``page.get(SIGNUP_URL)`` up to ``signup_entry_max_full_navs``
+        times, each resetting the reload counter
+      - never spin on click-only after reloads are exhausted
+
+    Multi-language CF hard-block pages raise CloudflareBlockedError immediately
+    so the account slot is consumed without endless reload loops.
+    """
     global page
     # Already on email step
     if _email_input_visible():
@@ -2911,18 +3605,35 @@ def click_email_signup_button(timeout=60, log_callback=None, cancel_callback=Non
             log_callback("[*] 邮箱输入框已存在，跳过入口点击")
         return True
 
-    deadline = time.time() + timeout
+    # Fail fast if the tab is a hard CF block (any language) instead of signup.
+    raise_if_cloudflare_blocked(log_callback, context="email-signup-entry")
+
+    max_reloads, max_full_navs, _, default_timeout = _signup_entry_limits()
+    if timeout is None:
+        timeout = default_timeout
+    deadline = time.time() + max(30, int(timeout))
     last_diag = 0.0
     attempt = 0
     reloads_done = 0
-    max_reloads = 4  # dead SPA is common — refresh quickly, don't burn strategies
+    full_navs_done = 0
+    if log_callback:
+        log_callback(
+            f"[*] 邮箱入口预算: hard-reload≤{max_reloads}/轮, "
+            f"完整导航≤{max_full_navs}, timeout={int(timeout)}s"
+        )
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        # Every loop: multi-language CF hard-block must not burn reload budget.
+        raise_if_cloudflare_blocked(
+            log_callback, context=f"email-signup-loop#{attempt}"
+        )
         attempt += 1
         if log_callback:
             log_callback(
-                f"[Debug] 尝试点击邮箱注册入口 (#{attempt})，"
-                "需出现邮箱输入框才算成功（支持 EN/JP/CN 等本地化文案）..."
+                f"[Debug] 尝试点击邮箱注册入口 (#{attempt}) "
+                f"[reload {reloads_done}/{max_reloads}, "
+                f"full-nav {full_navs_done}/{max_full_navs}]，"
+                "需出现邮箱输入框才算成功（多语言文案）..."
             )
 
         ok, detail = _native_click_email_signup(log_callback=log_callback)
@@ -2932,7 +3643,7 @@ def click_email_signup_button(timeout=60, log_callback=None, cancel_callback=Non
             return True
 
         # Short post-click window — if SPA is dead, refresh immediately
-        wait_until = time.time() + 1.2
+        wait_until = time.time() + 1.5
         while time.time() < wait_until:
             raise_if_cancelled(cancel_callback)
             if _email_input_visible():
@@ -2967,93 +3678,191 @@ return Array.from(document.querySelectorAll('button, a, [role="button"]'))
                 f"strategy={detail}; buttons={' | '.join(visible) if visible else 'none'}"
             )
 
-        # Immediately hard-refresh when click doesn't advance (don't wait long)
+        # 1) Hard reload (Page.reload / location.reload) — usually enough
         if reloads_done < max_reloads:
             reloads_done += 1
             try:
                 _reload_signup_page(
                     log_callback=log_callback,
                     cancel_callback=cancel_callback,
-                    reason=f"入口未前进，立即硬刷新 {reloads_done}/{max_reloads}",
+                    reason=(
+                        f"入口未前进，硬刷新 {reloads_done}/{max_reloads} "
+                        f"(full-nav {full_navs_done}/{max_full_navs})"
+                    ),
                 )
             except Exception as exc:
                 if log_callback:
                     log_callback(f"[Debug] 注册页刷新失败: {exc}")
             continue
 
-        sleep_with_cancel(0.5, cancel_callback)
+        # 2) Full navigation cycle — reset reload budget (stronger SPA rehydrate)
+        if full_navs_done < max_full_navs:
+            full_navs_done += 1
+            reloads_done = 0
+            try:
+                _full_navigate_signup(
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                    reason=f"硬刷新用尽，完整重开 {full_navs_done}/{max_full_navs}",
+                )
+                # One proactive hard reload after full nav (first paint often dead)
+                try:
+                    _reload_signup_page(
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                        reason=f"完整导航后主动硬刷新 ({full_navs_done}/{max_full_navs})",
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 完整导航失败: {exc}")
+            continue
+
+        # Budgets exhausted — stop spam-clicking; let outer open_signup retry
+        if log_callback:
+            log_callback(
+                f"[!] 邮箱入口刷新预算已用尽 "
+                f"(reload={max_reloads}× full-nav={max_full_navs})，停止本轮点击"
+            )
+        break
 
     if log_callback:
-        page_html = page.html[:500] if page else "no page"
+        try:
+            page_html = page.html[:500] if page else "no page"
+        except Exception:
+            page_html = "no page"
         log_callback(f"[Debug] 页面内容片段: {page_html}")
 
     raise Exception(
         "未进入邮箱注册步骤（邮箱注册按钮点击无效；"
+        f"已尝试硬刷新≤{max_reloads}/轮 × 完整导航≤{max_full_navs}；"
         "若使用 Browser Use 且 country=jp，按钮文案可能是「メールで登録」——已支持本地化匹配，请重试）"
     )
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
+    """Open sign-up and enter email step, with multi-attempt refresh retries."""
     global browser, page
     raise_if_cancelled(cancel_callback)
     if browser is None:
         start_browser()
         if log_callback:
             log_callback("[*] 浏览器已启动")
-    try:
-        page = browser.get_tab(0)
-        if log_callback:
-            log_callback(f"[*] 正在打开注册页: {SIGNUP_URL}")
-        # timeout bounds navigation even if some assets never finish
-        page.get(SIGNUP_URL, timeout=45)
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[Debug] 打开URL异常: {e}")
-        try:
-            page = browser.new_tab(SIGNUP_URL)
-        except Exception as e2:
-            if log_callback:
-                log_callback(f"[Debug] 创建新标签页异常: {e2}")
-            restart_browser()
-            page = browser.new_tab(SIGNUP_URL)
-    # Do not block on full network idle. SPA pages often keep the tab spinner
-    # running; proceed once DOM is ready (or after a short cap).
-    try:
-        page.wait.doc_loaded(timeout=10, raise_err=False)
-    except Exception as wait_exc:
-        if log_callback:
-            log_callback(f"[Debug] doc_loaded 等待结束/跳过: {wait_exc}")
-    try:
-        _cdp_activate_page()
-    except Exception:
-        pass
-    # Wait until email CTA is present, then one quick hard refresh (dead first paint).
-    _wait_signup_cta_ready(timeout=8, cancel_callback=cancel_callback)
-    sleep_with_cancel(0.6, cancel_callback)
-    # Early Turnstile/fetch hooks so later profile-step widget is wrapped.
-    try:
-        _install_turnstile_callback_hook(log_callback=log_callback)
-    except Exception:
-        pass
-    try:
-        _reload_signup_page(
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-            reason="首次加载后主动硬刷新",
-        )
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] 主动刷新跳过/失败: {exc}")
 
-    if log_callback:
+    max_reloads, max_full_navs, outer_retries, entry_timeout = _signup_entry_limits()
+    last_exc = None
+
+    for outer in range(1, outer_retries + 1):
+        raise_if_cancelled(cancel_callback)
+        if log_callback and outer_retries > 1:
+            log_callback(
+                f"[*] 打开注册页 / 进入邮箱步骤 "
+                f"(外层尝试 {outer}/{outer_retries})"
+            )
         try:
-            ready = page.run_js("return document.readyState;")
-        except Exception:
-            ready = "?"
-        log_callback(f"[*] 当前URL: {page.url} readyState={ready}")
-    click_email_signup_button(
-        log_callback=log_callback, cancel_callback=cancel_callback
-    )
+            try:
+                page = browser.get_tab(0)
+                if log_callback:
+                    log_callback(f"[*] 正在打开注册页: {SIGNUP_URL}")
+                # timeout bounds navigation even if some assets never finish
+                page.get(SIGNUP_URL, timeout=45)
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"[Debug] 打开URL异常: {e}")
+                try:
+                    page = browser.new_tab(SIGNUP_URL)
+                except Exception as e2:
+                    if log_callback:
+                        log_callback(f"[Debug] 创建新标签页异常: {e2}")
+                    restart_browser(log_callback=log_callback)
+                    page = browser.new_tab(SIGNUP_URL)
+            # Do not block on full network idle. SPA pages often keep the tab spinner
+            # running; proceed once DOM is ready (or after a short cap).
+            try:
+                page.wait.doc_loaded(timeout=10, raise_err=False)
+            except Exception as wait_exc:
+                if log_callback:
+                    log_callback(f"[Debug] doc_loaded 等待结束/跳过: {wait_exc}")
+            try:
+                _cdp_activate_page()
+            except Exception:
+                pass
+            # Hard CF block (any language) → fail slot immediately, do not outer-retry.
+            raise_if_cloudflare_blocked(
+                log_callback, context=f"open-signup-outer-{outer}"
+            )
+            # Wait until email CTA is present, then one quick hard refresh (dead first paint).
+            _wait_signup_cta_ready(timeout=8, cancel_callback=cancel_callback)
+            sleep_with_cancel(0.6, cancel_callback)
+            raise_if_cloudflare_blocked(
+                log_callback, context=f"open-signup-after-cta-wait-{outer}"
+            )
+            # Early Turnstile/fetch hooks so later profile-step widget is wrapped.
+            try:
+                _install_turnstile_callback_hook(log_callback=log_callback)
+            except Exception:
+                pass
+            try:
+                _reload_signup_page(
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                    reason=f"首次加载后主动硬刷新 (outer {outer}/{outer_retries})",
+                )
+            except CloudflareBlockedError:
+                raise
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 主动刷新跳过/失败: {exc}")
+
+            raise_if_cloudflare_blocked(
+                log_callback, context=f"open-signup-after-reload-{outer}"
+            )
+            if log_callback:
+                try:
+                    ready = page.run_js("return document.readyState;")
+                except Exception:
+                    ready = "?"
+                log_callback(f"[*] 当前URL: {page.url} readyState={ready}")
+            click_email_signup_button(
+                timeout=entry_timeout,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            return  # email step ready
+        except CloudflareBlockedError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            # Only outer-retry entry failures / navigation issues
+            is_entry = (
+                "未进入邮箱注册" in msg
+                or "邮箱注册" in msg
+                or "sign-up" in msg.lower()
+                or "signup" in msg.lower()
+                or "no page" in msg.lower()
+            )
+            if not is_entry or outer >= outer_retries:
+                raise
+            if log_callback:
+                log_callback(
+                    f"[!] 未进入邮箱步骤 (outer {outer}/{outer_retries}): {msg[:160]} "
+                    f"— 将完整重开注册页再试"
+                )
+            sleep_with_cancel(1.0, cancel_callback)
+            try:
+                _full_navigate_signup(
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                    reason=f"外层重试前导航 {outer}/{outer_retries}",
+                )
+            except Exception:
+                pass
+
+    if last_exc:
+        raise last_exc
+    raise Exception("未进入邮箱注册步骤（open_signup_page 外层重试用尽）")
 
 
 def has_profile_form(log_callback=None):
@@ -3206,7 +4015,12 @@ function emailCandidates() {
         const type = (node.getAttribute('type') || '').toLowerCase();
         if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search'].includes(type)) continue;
         const meta = textOf(node).toLowerCase();
-        if (meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') || meta.includes('邮箱') || meta.includes('电子邮件')) {
+        if (
+            meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') ||
+            meta.includes('邮箱') || meta.includes('电子邮件') || meta.includes('郵件') || meta.includes('電郵') ||
+            meta.includes('メール') || meta.includes('이메일') || meta.includes('correo') ||
+            meta.includes('courriel') || meta.includes('почт') || meta.includes('อีเมล')
+        ) {
             direct.push(node);
         }
     }
@@ -3317,7 +4131,12 @@ function emailCandidates() {
         const type = (node.getAttribute('type') || '').toLowerCase();
         if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search'].includes(type)) continue;
         const meta = textOf(node).toLowerCase();
-        if (meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') || meta.includes('邮箱') || meta.includes('电子邮件')) {
+        if (
+            meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') ||
+            meta.includes('邮箱') || meta.includes('电子邮件') || meta.includes('郵件') || meta.includes('電郵') ||
+            meta.includes('メール') || meta.includes('이메일') || meta.includes('correo') ||
+            meta.includes('courriel') || meta.includes('почт') || meta.includes('อีเมล')
+        ) {
             direct.push(node);
         }
     }
@@ -3335,15 +4154,27 @@ const submitButton = buttons.find((node) => {
     return (
         text === '注册' ||
         text.includes('注册') ||
+        text.includes('註冊') ||
         text.includes('继续') ||
+        text.includes('繼續') ||
         text.includes('下一步') ||
         text.includes('确认') ||
+        text.includes('確認') ||
+        text.includes('登録') ||
+        text.includes('続行') ||
+        text.includes('가입') ||
+        text.includes('계속') ||
         lower.includes('signup') ||
         lower.includes('sign up') ||
         lower.includes('continue') ||
         lower.includes('next') ||
         lower.includes('createaccount') ||
-        lower.includes('submit')
+        lower.includes('submit') ||
+        lower.includes('registr') ||
+        lower.includes('fortfahren') ||
+        lower.includes('weiter') ||
+        lower.includes('continuer') ||
+        lower.includes('continuar')
     );
 });
 if (submitButton) {
@@ -3392,7 +4223,13 @@ def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cance
 const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = nodes.find((node) => {
   const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-  return t.includes('重新发送') || t.includes('resend') || t.includes('再次发送');
+  return (
+    t.includes('重新发送') || t.includes('重新傳送') || t.includes('再次发送') ||
+    t.includes('resend') || t.includes('re-send') ||
+    t.includes('再送信') || t.includes('再送') || t.includes('コードを再') ||
+    t.includes('다시보내') || t.includes('erneutsenden') || t.includes('renvoyer') ||
+    t.includes('reenviar') || t.includes('ส่งอีกครั้ง') || t.includes('gửilại') || t.includes('kirimulang')
+  );
 });
 if (target && !target.disabled) { target.click(); return true; }
 return false;
@@ -3631,7 +4468,8 @@ const textHosts = Array.from(document.querySelectorAll('div, label, span, p, sec
   .slice(0, 6);
 // Complete button — used as geometric fallback (widget sits ~65-90px above it).
 const completeBtn = Array.from(document.querySelectorAll('button')).find((b) =>
-  /complete\s*sign\s*up|完成注册|完成註冊/i.test((b.innerText || b.textContent || '').trim())
+  /complete\s*sign\s*up|完成注册|完成註冊|登録を完了|가입\s*완료|create\s*account|アカウントを作成|创建账户|创建帐户|registrierung\s*abschließen|completar\s*registro|concluir\s*cadastro/i
+    .test((b.innerText || b.textContent || '').trim())
 );
 let clickTarget = null;
 let pointSource = '';
@@ -5039,7 +5877,7 @@ def ensure_turnstile_before_submit(
     log_callback=None,
     cancel_callback=None,
     timeout=45,
-    settle_seconds=8.0,
+    settle_seconds=None,
 ):
     """
     After profile fill: WAIT for Turnstile to appear, solve it, THEN allow Complete.
@@ -5047,8 +5885,11 @@ def ensure_turnstile_before_submit(
     Never rush Complete. Flow:
       1. Human settle pause (widget often paints a few seconds after fill)
       2. Poll for token / checkbox / cf-turnstile-response field
-      3. If challenge present (or empty CF field) → click checkbox until token
+      3. If challenge present (or empty CF field) → quiet local / CapMonster solve
       4. Only return when token ready, or settle window ends with zero CF signals
+
+    Lesson from live runs: early click-spam on managed CF causes "Pengesahan gagal";
+    soft-pass often needs passive idle after extension once-click.
     """
     global page
     if page is None:
@@ -5060,23 +5901,29 @@ def ensure_turnstile_before_submit(
             log_callback(f"[*] Turnstile 已有 token（长度={len(token)}），可提交")
         return token
 
-    settle = max(float(settle_seconds or 8.0), 3.0)
+    _, _, _, _, default_settle = _turnstile_local_limits()
+    if settle_seconds is None:
+        settle = default_settle
+    else:
+        settle = max(float(settle_seconds or default_settle), 3.0)
     if log_callback:
         log_callback(
-            f"[*] 资料已填完 — 先等待最多 {settle:.0f}s 看 Turnstile 是否出现，"
-            "不会立刻点 Complete sign up"
+            f"[*] 资料已填完 — 先被动等待最多 {settle:.0f}s 看 soft-pass / 扩展 once-click，"
+            "不会立刻点 Complete 或狂点验证框"
         )
 
-    # Phase A: passive watch (do not click Complete; optionally soft-click checkbox if already visible)
+    # Phase A: passive watch only — do NOT click Turnstile yet (extension may soft-pass).
     paint_deadline = time.time() + settle
     saw_challenge = False
     last_log = 0.0
+    # Stay passive for most of settle; only note signals. Solving starts after settle
+    # (or earlier only if a long token already appeared).
     while time.time() < paint_deadline:
         raise_if_cancelled(cancel_callback)
         token = _read_turnstile_token()
         if len(token) >= 80:
             if log_callback:
-                log_callback(f"[*] Turnstile 已通过（等待期间），token长度={len(token)}")
+                log_callback(f"[*] Turnstile 已通过（等待期间 soft-pass），token长度={len(token)}")
             return token
 
         state = _probe_turnstile_state() or {}
@@ -5086,19 +5933,19 @@ def ensure_turnstile_before_submit(
         human = bool(state.get("visibleHuman") or state.get("textHits") or state.get("point"))
         if has_field or widgets > 0 or human or _turnstile_needs_solve():
             saw_challenge = True
-            # Start interacting as soon as we see a signal (don't wait full settle idle)
-            if log_callback and time.time() - last_log >= 2.0:
+            remaining = paint_deadline - time.time()
+            # Keep waiting passively so extension once-click / CF idle can soft-pass
+            if log_callback and time.time() - last_log >= 3.0:
                 last_log = time.time()
                 log_callback(
-                    f"[*] 已出现人机验证信号 field={has_field} widgets={widgets} "
-                    f"human={human} — 开始点选 Turnstile（仍不点 Complete）"
+                    f"[*] 已见人机信号 field={has_field} widgets={widgets} human={human} "
+                    f"— 继续被动等待 soft-pass（剩余 {remaining:.1f}s，仍不点 Complete）"
                 )
-            break
         remaining = paint_deadline - time.time()
-        if log_callback and time.time() - last_log >= 2.5:
+        if log_callback and time.time() - last_log >= 3.0:
             last_log = time.time()
-            log_callback(f"[Debug] 等待 Turnstile 出现… 剩余 {remaining:.1f}s state={state}")
-        sleep_with_cancel(0.5, cancel_callback)
+            log_callback(f"[Debug] 被动等待 Turnstile… 剩余 {remaining:.1f}s state={state}")
+        sleep_with_cancel(0.6, cancel_callback)
 
     state = _probe_turnstile_state() or {}
     if log_callback:
@@ -5215,24 +6062,33 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=35):
             "（managed Turnstile 通常会 Pengesahan gagal）"
         )
 
-    # --- Local click fallback (extension once-click first, then sparse CDP) ---
-    timeout_s = max(int(timeout or 35), 5)
-    # Don't burn too long on hopeless CDP spam when CapMonster was available
-    if capmonster_is_enabled():
+    # --- Local path: extension once-click + long passive wait + sparse CDP ---
+    # Live lesson: 4+ rapid CDP clicks → "Pengesahan gagal"; idle after stop → soft-pass.
+    max_clicks, click_interval, default_local_to, extension_grace, _ = (
+        _turnstile_local_limits()
+    )
+    timeout_s = max(int(timeout or default_local_to), 5)
+    if not capmonster_is_enabled():
+        # No-solver path needs room for soft-pass after extension click
+        timeout_s = max(timeout_s, default_local_to)
+    else:
+        # CapMonster already tried; short sparse fallback only
         timeout_s = min(timeout_s, 20)
+        max_clicks = min(max_clicks, 1)
+
     started = time.time()
     deadline = started + timeout_s
     last_click = 0.0
     last_diag = 0.0
     attempt = 0
     clicks = 0
-    max_clicks = 4  # avoid hammering into "Pengesahan gagal"
-    # Let turnstilePatch (once-click @ ~1.5s) try before we CDP-spam the checkbox.
-    extension_grace = min(3.5, max(1.5, _turnstile_warmup_seconds() + 1.0))
+    # Prefer configured grace; still at least warmup + extension delay (~1.5s)
+    extension_grace = max(extension_grace, _turnstile_warmup_seconds() + 1.0)
     if log_callback:
         log_callback(
-            f"[*] 本地点击路径：先等扩展 once-click ~{extension_grace:.1f}s，"
-            "再稀疏 CDP（最多 4 次）"
+            f"[*] 本地静默路径：先等扩展 once-click ~{extension_grace:.1f}s，"
+            f"再最多 {max_clicks} 次 CDP（间隔 ≥{click_interval:.0f}s），"
+            f"总预算 {timeout_s}s — 避免狂点重置 managed CF"
         )
 
     while time.time() < deadline:
@@ -5248,18 +6104,50 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=35):
         # Extension grace: only poll token; no Python click yet
         if now - started < extension_grace:
             if log_callback and attempt == 1:
-                log_callback("[*] 等待 turnstilePatch 单次自动点击…")
-            sleep_with_cancel(0.5, cancel_callback)
+                log_callback("[*] 等待 turnstilePatch 单次自动点击 + soft-pass…")
+            sleep_with_cancel(0.6, cancel_callback)
             continue
 
-        if clicks < max_clicks and now - last_click >= 4.5:
+        # After grace: still mostly passive. Click only if still no token and budget left.
+        if (
+            max_clicks > 0
+            and clicks < max_clicks
+            and now - last_click >= click_interval
+        ):
+            # Extra passive beat right before first CDP click (CF often still verifying)
+            if clicks == 0:
+                sleep_with_cancel(min(2.0, click_interval * 0.25), cancel_callback)
+                token = _read_turnstile_token()
+                if len(token) >= 80:
+                    if log_callback:
+                        log_callback(
+                            f"[*] Turnstile soft-pass（CDP 点击前），token长度={len(token)}"
+                        )
+                    return token
             detail = _click_turnstile_widget(log_callback=log_callback)
-            last_click = now
+            last_click = time.time()
             clicks += 1
             if log_callback:
-                log_callback(f"[Debug] Turnstile 本地点击 {clicks}/{max_clicks}: {detail}")
+                log_callback(
+                    f"[Debug] Turnstile 稀疏本地点击 {clicks}/{max_clicks}: {detail}"
+                )
+            # After each click, wait longer before next poll cycle (let CF settle)
+            sleep_with_cancel(min(2.5, click_interval * 0.35), cancel_callback)
+            continue
 
-        if log_callback and now - last_diag >= 8:
+        if clicks >= max_clicks and max_clicks > 0:
+            # Exhausted click budget — pure passive wait for soft-pass
+            if log_callback and now - last_diag >= 10:
+                last_diag = now
+                state = _probe_turnstile_state()
+                log_callback(
+                    f"[*] 本地点击预算已用尽 ({max_clicks})，被动等待 soft-pass… "
+                    f"state={state}"
+                )
+            sleep_with_cancel(1.0, cancel_callback)
+            continue
+
+        if log_callback and now - last_diag >= 10:
             last_diag = now
             state = _probe_turnstile_state()
             log_callback(f"[Debug] Turnstile 状态: {state}")
@@ -5422,29 +6310,44 @@ return 'filled-no-submit';
         # ALWAYS wait + solve Turnstile BEFORE Complete (never rush the black button).
         # Install render-hook early so CapMonster inject can fire SPA callback.
         _install_turnstile_callback_hook(log_callback=log_callback)
+        _, _, local_to, _, settle_default = _turnstile_local_limits()
         try:
             ensure_turnstile_before_submit(
                 log_callback=log_callback,
                 cancel_callback=cancel_callback,
-                # CapMonster cloud solve often needs 30–90s; local click is shorter
-                timeout=max(55, int(config.get("capmonster_timeout") or 120) if capmonster_is_enabled() else 55),
-                settle_seconds=8.0,
+                # CapMonster: long cloud budget; local: quiet timeout for soft-pass
+                timeout=(
+                    max(55, int(config.get("capmonster_timeout") or 120))
+                    if capmonster_is_enabled()
+                    else max(55, local_to)
+                ),
+                settle_seconds=settle_default,
             )
         except Exception as cf_exc:
             if log_callback:
                 log_callback(f"[Debug] Turnstile 未就绪，暂不点 Complete: {cf_exc}")
-            sleep_with_cancel(1.0, cancel_callback)
+            sleep_with_cancel(1.5, cancel_callback)
             continue
 
         # Hard block: still unsolved CF field / human checkbox → do not mark Complete
         if _turnstile_needs_solve() and len(_read_turnstile_token()) < 80:
+            extra_click = config.get("turnstile_fill_loop_extra_click", False)
             if log_callback:
-                log_callback("[*] Turnstile 仍未通过 — 继续等待/点击验证框，跳过 Complete")
-            try:
-                _click_turnstile_widget(log_callback=log_callback)
-            except Exception:
-                pass
-            sleep_with_cancel(1.2, cancel_callback)
+                if extra_click:
+                    log_callback(
+                        "[*] Turnstile 仍未通过 — 额外 CDP 点击一次，跳过 Complete"
+                    )
+                else:
+                    log_callback(
+                        "[*] Turnstile 仍未通过 — 被动再等（不额外狂点），跳过 Complete"
+                    )
+            # Default OFF: fill-loop re-clicks were resetting managed challenges.
+            if extra_click:
+                try:
+                    _click_turnstile_widget(log_callback=log_callback)
+                except Exception:
+                    pass
+            sleep_with_cancel(2.0 if not extra_click else 1.2, cancel_callback)
             continue
 
         # Token ready but button still disabled → force-enable before probe (web-style).
@@ -5472,17 +6375,25 @@ function buttonText(node) {
 }
 function isSignupSubmit(node) {
     const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    if (t.includes('goback') || t.includes('go back') || t.includes('返回') || t.includes('戻る')) return false;
+    const raw = buttonText(node);
+    if (t.includes('goback') || t.includes('go back') || t.includes('返回') || t.includes('戻る') || t.includes('뒤로') || t.includes('zurück') || t.includes('retour') || t.includes('atrás') || t.includes('voltar')) return false;
     if (t.includes('email') && !t.includes('complete')) return false;
     return (
-      t.includes('完成注册') || t.includes('创建账户') || t.includes('创建帐户') ||
+      t.includes('完成注册') || t.includes('完成註冊') || t.includes('创建账户') || t.includes('创建帐户') || t.includes('建立帳戶') ||
       t.includes('completesignup') || t.includes('completeyoursignup') ||
       t.includes('complete sign up') || t.includes('createaccount') || t.includes('create account') ||
       t.includes('登録を完了') || t.includes('登録完了') || t.includes('アカウントを作成') ||
-      t.includes('登録する') ||
+      t.includes('登録する') || t.includes('가입완료') || t.includes('계정만들기') ||
+      t.includes('registrierungabschließen') || t.includes('kontoerstellen') ||
+      t.includes("terminerl'inscription") || t.includes('créeruncompte') ||
+      t.includes('completarregistro') || t.includes('crearcuenta') ||
+      t.includes('concluircadastro') || t.includes('criaconta') ||
       (t.includes('sign up') && !t.includes('with')) ||
       t.includes('submit') || t.includes('continue') || t.includes('next') ||
-      t.includes('完了') || t.includes('続行') || t.includes('続ける')
+      t.includes('完了') || t.includes('続行') || t.includes('続ける') ||
+      t.includes('fortfahren') || t.includes('weiter') || t.includes('continuer') ||
+      t.includes('continuar') || t.includes('siguiente') || t.includes('próximo') ||
+      raw.includes('등록을 완료') || raw.includes('Registrierung abschließen')
     );
 }
 
@@ -5637,15 +6548,32 @@ def _playwright_click_signup_submit(log_callback=None):
         "Create account",
         "Create your account",
         "完成注册",
+        "完成註冊",
         "创建账户",
+        "创建帐户",
+        "建立帳戶",
         "登録を完了",
         "登録する",
         "アカウントを作成",
+        "가입 완료",
+        "계정 만들기",
+        "Registrierung abschließen",
+        "Konto erstellen",
+        "Terminer l'inscription",
+        "Créer un compte",
+        "Completar registro",
+        "Crear cuenta",
+        "Concluir cadastro",
+        "Criar conta",
         "Sign up",
         "Continue",
         "Next",
         "続行",
         "続ける",
+        "Fortfahren",
+        "Weiter",
+        "Continuer",
+        "Continuar",
     ]
     for text in labels:
         try:
@@ -5805,14 +6733,17 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
                 )
                 if needs_cf:
                     if log_callback:
-                        log_callback("[*] 最终页：Turnstile 未通过 — 只点验证框，不点 Complete")
+                        log_callback(
+                            "[*] 最终页：Turnstile 未通过 — 静默重试验证（不点 Complete）"
+                        )
                     try:
-                        if now - last_cf_retry_at >= 2:
+                        # Space CF retries: hammering every 2s resets managed widget
+                        if now - last_cf_retry_at >= 12.0:
                             ensure_turnstile_before_submit(
                                 log_callback=log_callback,
                                 cancel_callback=cancel_callback,
-                                timeout=28,
-                                settle_seconds=2.0,
+                                timeout=35,
+                                settle_seconds=6.0,
                             )
                             last_cf_retry_at = time.time()
                     except Exception as cf_exc:
@@ -6146,7 +7077,10 @@ class GrokRegisterGUI:
             driver_default = "local"
         self.browser_driver_var = tk.StringVar(value=driver_default)
         self.browser_driver_combo = tk_option_menu(
-            config_frame, self.browser_driver_var, ["local", "browser_use", "roxy"], width=12
+            config_frame,
+            self.browser_driver_var,
+            ["local", "browser_use", "browserbase", "roxy"],
+            width=12,
         )
         add_field(self.browser_driver_combo, 2, 1, sticky=tk.W)
 
@@ -6372,6 +7306,14 @@ class GrokRegisterGUI:
         print(line, flush=True)
         self.log_text.insert(tk.END, f"{line}\n")
         self.log_text.see(tk.END)
+        try:
+            import run_output as _run_out
+
+            active = _run_out.get_active_run()
+            if active is not None:
+                active.append_log_line(line)
+        except Exception:
+            pass
 
     def clear_log(self):
         self.log_text.delete(1.0, tk.END)
@@ -6437,6 +7379,12 @@ class GrokRegisterGUI:
         if get_browser_driver() == "browser_use" and not str(config.get("browser_use_api_key") or "").strip():
             self.log("[!] Browser Use 模式需要填写 browser_use_api_key")
             return
+        if get_browser_driver() == "browserbase" and not (
+            str(config.get("browserbase_api_key") or "").strip()
+            or str(os.environ.get("BROWSERBASE_API_KEY") or "").strip()
+        ):
+            self.log("[!] Browserbase 模式需要填写 browserbase_api_key / BROWSERBASE_API_KEY")
+            return
         if get_browser_driver() == "roxy" and not str(config.get("roxy_api_token") or "").strip():
             self.log("[!] Roxy 模式需要填写 roxy_api_token（config / 环境变量 ROXY_API_TOKEN）")
             return
@@ -6451,10 +7399,7 @@ class GrokRegisterGUI:
         self.success_count = 0
         self.fail_count = 0
         self.results = []
-        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
+        self.accounts_output_file = ""
         self.update_stats()
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
@@ -6472,7 +7417,6 @@ class GrokRegisterGUI:
                 f"one_profile={config.get('roxy_one_profile_per_account')} "
                 f"delete_after={config.get('roxy_delete_profile_after_run', True)}"
             )
-        self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
         threading.Thread(
             target=self.run_registration,
             args=(count,),
@@ -6484,7 +7428,17 @@ class GrokRegisterGUI:
         self.log("[!] 用户停止注册")
 
     def run_registration(self, count):
+        import run_output as _run_out
+
+        run = None
         try:
+            run = _run_out.begin_run(
+                config,
+                log_callback=self.log,
+                note_template=build_cpa_export_note(),
+            )
+            self.accounts_output_file = run.accounts_output_file
+            self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
             start_browser(log_callback=self.log)
             self.log("[*] 浏览器已启动")
             i = 0
@@ -6494,8 +7448,8 @@ class GrokRegisterGUI:
                 if self.should_stop():
                     break
                 self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                email = ""
                 try:
-                    email = ""
                     dev_token = ""
                     code = ""
                     mail_ok = False
@@ -6512,12 +7466,8 @@ class GrokRegisterGUI:
                         self.log(f"[*] 邮箱: {email}")
                         self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                         try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
+                            if run is not None:
+                                run.append_mail_credential(email, dev_token)
                         except Exception:
                             pass
                         self.log("[*] 3. 拉取验证码")
@@ -6563,9 +7513,13 @@ class GrokRegisterGUI:
                             self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                     self.results.append({"email": email, "sso": sso, "profile": profile})
                     try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
+                        if run is not None:
+                            run.append_success(
+                                email,
+                                profile.get("password", ""),
+                                sso,
+                                profile=profile,
+                            )
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
                     add_sso_to_cpa(sso, email=email, log_callback=self.log)
@@ -6585,6 +7539,19 @@ class GrokRegisterGUI:
                 except RegistrationCancelled:
                     self.log("[!] 注册被用户停止")
                     break
+                except CloudflareBlockedError as exc:
+                    # Obvious CF block page: consume 1 --count slot, no slot-retry spam.
+                    self.fail_count += 1
+                    if run is not None:
+                        run.append_failure(
+                            "cloudflare_block",
+                            str(exc),
+                            email=email,
+                            slot=i + 1,
+                        )
+                    retry_count_for_slot = 0
+                    i += 1
+                    self.log(f"[-] Cloudflare 拦截，本槽位失败并计入 count: {exc}")
                 except AccountRetryNeeded as exc:
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
@@ -6593,6 +7560,13 @@ class GrokRegisterGUI:
                         )
                     else:
                         self.fail_count += 1
+                        if run is not None:
+                            run.append_failure(
+                                "max_slot_retry",
+                                str(exc),
+                                email=email,
+                                slot=i + 1,
+                            )
                         self.log(
                             f"[-] 当前账号已达到最大重试次数，跳过: {exc}"
                         )
@@ -6600,6 +7574,13 @@ class GrokRegisterGUI:
                         i += 1
                 except Exception as exc:
                     self.fail_count += 1
+                    if run is not None:
+                        run.append_failure(
+                            "register",
+                            str(exc),
+                            email=email,
+                            slot=i + 1,
+                        )
                     retry_count_for_slot = 0
                     i += 1
                     self.log(f"[-] 注册失败: {exc}")
@@ -6629,6 +7610,15 @@ class GrokRegisterGUI:
                 stop_browser()
             except BaseException:
                 pass
+            try:
+                _run_out.end_run(
+                    succeeded=self.success_count,
+                    failed=self.fail_count,
+                    attempted_slots=self.success_count + self.fail_count,
+                    log_callback=self.log,
+                )
+            except BaseException:
+                pass
             self._set_running_ui(False)
             self.log("[*] 任务结束")
 
@@ -6646,10 +7636,21 @@ class CliStopController:
 
 def cli_log(message):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {message}", flush=True)
+    line = f"[{timestamp}] {message}"
+    print(line, flush=True)
+    try:
+        import run_output as _run_out
+
+        active = _run_out.get_active_run()
+        if active is not None:
+            active.append_log_line(line)
+    except Exception:
+        pass
 
 
 def run_registration_cli(count):
+    import run_output as _run_out
+
     controller = CliStopController()
 
     # 一次 Ctrl+C 可靠置停：SIGINT 处理器直接设停止标志，不依赖异常在
@@ -6671,22 +7672,35 @@ def run_registration_cli(count):
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-    )
-    cli_log(f"[*] 终端模式启动，目标数量: {count}")
-    cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    run = None
     try:
+        success_target = max(0, int(config.get("register_success_target") or 0))
+    except (TypeError, ValueError):
+        success_target = 0
+    cli_log(f"[*] 终端模式启动，目标数量: {count}")
+    if success_target > 0:
+        cli_log(f"[*] 成功即停目标: ≥{success_target}（最多尝试 {count} 个槽位）")
+    try:
+        run = _run_out.begin_run(
+            config,
+            log_callback=cli_log,
+            note_template=build_cpa_export_note(),
+        )
+        cli_log(f"[*] 成功账号将实时保存到: {run.accounts_output_file}")
         start_browser(log_callback=cli_log)
         cli_log("[*] 浏览器已启动")
         i = 0
         while i < count:
             if controller.should_stop():
                 break
+            if success_target > 0 and success_count >= success_target:
+                cli_log(
+                    f"[*] 已达成功目标 {success_count}/{success_target}，停止后续尝试"
+                )
+                break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            email = ""
             try:
-                email = ""
                 dev_token = ""
                 code = ""
                 mail_ok = False
@@ -6703,12 +7717,8 @@ def run_registration_cli(count):
                     cli_log(f"[*] 邮箱: {email}")
                     cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                     try:
-                        with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
+                        if run is not None:
+                            run.append_mail_credential(email, dev_token)
                     except Exception:
                         pass
                     cli_log("[*] 3. 拉取验证码")
@@ -6753,9 +7763,13 @@ def run_registration_cli(count):
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
+                    if run is not None:
+                        run.append_success(
+                            email,
+                            profile.get("password", ""),
+                            sso,
+                            profile=profile,
+                        )
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 add_sso_to_cpa(sso, email=email, log_callback=cli_log)
@@ -6764,6 +7778,11 @@ def run_registration_cli(count):
                 i += 1
                 cli_log(f"[+] 注册成功: {email}")
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
+                if success_target > 0 and success_count >= success_target:
+                    cli_log(
+                        f"[*] 已达成功目标 {success_count}/{success_target}，结束循环"
+                    )
+                    break
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
                     cleanup_runtime_memory(
                         log_callback=cli_log,
@@ -6772,6 +7791,20 @@ def run_registration_cli(count):
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
                 break
+            except CloudflareBlockedError as exc:
+                # Obvious CF block page: consume 1 --count slot, no slot-retry spam.
+                fail_count += 1
+                if run is not None:
+                    run.append_failure(
+                        "cloudflare_block",
+                        str(exc),
+                        email=email,
+                        slot=i + 1,
+                    )
+                retry_count_for_slot = 0
+                i += 1
+                cli_log(f"[-] Cloudflare 拦截，本槽位失败并计入 count: {exc}")
+                cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
             except AccountRetryNeeded as exc:
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
@@ -6780,16 +7813,32 @@ def run_registration_cli(count):
                     )
                 else:
                     fail_count += 1
+                    if run is not None:
+                        run.append_failure(
+                            "max_slot_retry",
+                            str(exc),
+                            email=email,
+                            slot=i + 1,
+                        )
                     retry_count_for_slot = 0
                     i += 1
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
             except Exception as exc:
                 fail_count += 1
+                if run is not None:
+                    run.append_failure(
+                        "register",
+                        str(exc),
+                        email=email,
+                        slot=i + 1,
+                    )
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[-] 注册失败: {exc}")
             finally:
                 if controller.should_stop():
+                    break
+                if success_target > 0 and success_count >= success_target:
                     break
                 try:
                     if browser is None:
@@ -6825,6 +7874,15 @@ def run_registration_cli(count):
         except BaseException:
             pass
         try:
+            _run_out.end_run(
+                succeeded=success_count,
+                failed=fail_count,
+                attempted_slots=success_count + fail_count,
+                log_callback=cli_log,
+            )
+        except BaseException:
+            pass
+        try:
             cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
         except BaseException:
             pass
@@ -6851,9 +7909,9 @@ def _apply_cli_overrides(argv):
     )
     parser.add_argument(
         "--driver",
-        choices=["local", "browser_use", "roxy", "chromium", "bu"],
+        choices=["local", "browser_use", "browserbase", "roxy", "chromium", "bu", "bb"],
         default=None,
-        help="浏览器驱动: local | browser_use | roxy",
+        help="浏览器驱动: local | browser_use | browserbase | roxy",
     )
     parser.add_argument(
         "--browser-use-key",
@@ -6917,7 +7975,71 @@ def _apply_cli_overrides(argv):
         action="store_true",
         help="禁用 CapMonster，仅本地点击 Turnstile",
     )
+    parser.add_argument(
+        "--success-target",
+        type=int,
+        default=None,
+        help="达到该成功数后提前结束（0=跑满 register_count）",
+    )
+    parser.add_argument(
+        "--domain",
+        default=None,
+        help="Cloudflare/临时邮箱收信域名（覆盖 config.defaultDomains；可逗号分隔）",
+    )
+    parser.add_argument(
+        "--run-suffix",
+        dest="run_suffix",
+        default=None,
+        help="写入 output_run_suffix，区分并行 run 文件夹（如 flyover / yuyu）",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        help="可选：从指定 JSON 加载配置（默认仓库内 config.json）",
+    )
+    parser.add_argument(
+        "--bb-key",
+        dest="bb_key",
+        default=None,
+        help="Browserbase API Key（也可写在 config.json / BROWSERBASE_API_KEY）",
+    )
+    parser.add_argument(
+        "--bb-region",
+        dest="bb_region",
+        default=None,
+        help="Browserbase region: us-west-2 | us-east-1 | eu-central-1 | ap-southeast-1",
+    )
+    parser.add_argument(
+        "--bb-proxy-country",
+        dest="bb_proxy_country",
+        default=None,
+        help="Browserbase 代理国家代码（如 JP）；会打开 browserbase_use_proxy",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="CLI 跳过交互确认，直接开始注册",
+    )
     args, unknown = parser.parse_known_args(argv)
+
+    # Optional alternate config file (before other overrides)
+    if getattr(args, "config_path", None):
+        cfg_path = os.path.abspath(os.path.expanduser(str(args.config_path).strip()))
+        if not os.path.isfile(cfg_path):
+            raise SystemExit(f"[!] --config 文件不存在: {cfg_path}")
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError("config root must be object")
+            config.update(loaded)
+            config["_cli_config_path"] = cfg_path
+        except SystemExit:
+            raise
+        except Exception as exc:
+            raise SystemExit(f"[!] 无法加载 --config {cfg_path}: {exc}") from exc
 
     if args.driver:
         driver = args.driver.strip().lower()
@@ -6925,6 +8047,8 @@ def _apply_cli_overrides(argv):
             config["browser_driver"] = "local"
         elif driver in ("roxy", "roxybrowser"):
             config["browser_driver"] = "roxy"
+        elif driver in ("browserbase", "bb", "browser_base", "browser-base"):
+            config["browser_driver"] = "browserbase"
         else:
             config["browser_driver"] = "browser_use"
     if args.browser_use_key is not None:
@@ -6949,12 +8073,35 @@ def _apply_cli_overrides(argv):
         config["capmonster_api_key"] = args.capmonster_key.strip()
     if args.no_capmonster:
         config["capmonster_enabled"] = False
+    if args.success_target is not None:
+        config["register_success_target"] = max(0, int(args.success_target))
+    if getattr(args, "domain", None) is not None:
+        domain = str(args.domain).strip()
+        if domain:
+            config["defaultDomains"] = domain
+    if getattr(args, "run_suffix", None) is not None:
+        config["output_run_suffix"] = str(args.run_suffix).strip()
+    if getattr(args, "bb_key", None) is not None:
+        config["browserbase_api_key"] = str(args.bb_key).strip()
+    if getattr(args, "bb_region", None) is not None:
+        config["browserbase_region"] = str(args.bb_region).strip()
+    if getattr(args, "bb_proxy_country", None) is not None:
+        country = str(args.bb_proxy_country).strip().upper()
+        config["browserbase_proxy_country"] = country
+        if country:
+            config["browserbase_use_proxy"] = True
+    if getattr(args, "yes", False):
+        config["_cli_auto_start"] = True
 
-    # Env fallback for Browser Use / Roxy / CapMonster keys
+    # Env fallback for Browser Use / Browserbase / Roxy / CapMonster keys
     if not str(config.get("browser_use_api_key") or "").strip():
         env_key = os.environ.get("BROWSER_USE_API_KEY", "").strip()
         if env_key:
             config["browser_use_api_key"] = env_key
+    if not str(config.get("browserbase_api_key") or "").strip():
+        env_bb = os.environ.get("BROWSERBASE_API_KEY", "").strip()
+        if env_bb:
+            config["browserbase_api_key"] = env_bb
     if not str(config.get("roxy_api_token") or "").strip():
         env_roxy = os.environ.get("ROXY_API_TOKEN", "").strip()
         if env_roxy:
@@ -6983,9 +8130,20 @@ def main_cli():
     count = int(config.get("register_count", 1) or 1)
     driver = get_browser_driver()
     cli_log("[*] CLI 已加载配置")
+    if config.get("_cli_config_path"):
+        cli_log(f"[*] 配置文件: {config.get('_cli_config_path')}")
+    domain = str(config.get("defaultDomains") or "").strip() or "-"
+    success_target = 0
+    try:
+        success_target = max(0, int(config.get("register_success_target") or 0))
+    except (TypeError, ValueError):
+        success_target = 0
+    suffix = str(config.get("output_run_suffix") or "").strip()
     cli_log(
         f"[*] 邮箱服务商: {config.get('email_provider', 'duckmail')} | "
-        f"驱动: {driver} | 注册数量: {count}"
+        f"域名: {domain} | 驱动: {driver} | 注册数量: {count}"
+        + (f" | 成功目标: {success_target}" if success_target else "")
+        + (f" | run_suffix: {suffix}" if suffix else "")
     )
     if driver == "browser_use":
         if not str(config.get("browser_use_api_key") or "").strip():
@@ -6996,6 +8154,19 @@ def main_cli():
             f"use_proxy={config.get('browser_use_use_proxy')} "
             f"timeout_min={config.get('browser_use_timeout_minutes', 15)} "
             f"profile={config.get('browser_use_profile_id') or '-'}"
+        )
+    if driver == "browserbase":
+        if not str(config.get("browserbase_api_key") or "").strip():
+            cli_log(
+                "[!] Browserbase 需要 browserbase_api_key（config / --bb-key / BROWSERBASE_API_KEY）"
+            )
+            return
+        cli_log(
+            f"[*] Browserbase: region={config.get('browserbase_region') or 'us-west-2'} "
+            f"use_proxy={config.get('browserbase_use_proxy')} "
+            f"proxy_country={config.get('browserbase_proxy_country') or '-'} "
+            f"timeout_min={config.get('browserbase_timeout_minutes', 15)} "
+            f"solve_captchas={config.get('browserbase_solve_captchas', True)}"
         )
     if capmonster_is_enabled():
         cli_log(
@@ -7016,15 +8187,21 @@ def main_cli():
             f"delete_after={config.get('roxy_delete_profile_after_run', True)} "
             f"os={config.get('roxy_default_os') or 'Windows'}"
         )
-    cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
-    try:
-        command = input("> ").strip().lower()
-    except KeyboardInterrupt:
-        cli_log("[!] 已取消")
-        return
-    if command != "start":
-        cli_log("[!] 未输入 start，已退出")
-        return
+    auto = bool(config.get("_cli_auto_start")) or str(
+        os.environ.get("GROK_REGISTER_AUTO_START", "")
+    ).strip().lower() in ("1", "true", "yes", "y")
+    if auto:
+        cli_log("[*] 自动开始（--yes / GROK_REGISTER_AUTO_START）")
+    else:
+        cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
+        try:
+            command = input("> ").strip().lower()
+        except KeyboardInterrupt:
+            cli_log("[!] 已取消")
+            return
+        if command != "start":
+            cli_log("[!] 未输入 start，已退出")
+            return
     try:
         run_registration_cli(count)
     except KeyboardInterrupt:

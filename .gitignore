@@ -11,6 +11,8 @@ accounts_*.txt
 mail_credentials.txt
 *.txt
 !requirements.txt
+!output/.gitkeep
+!output/runs/.gitkeep
 
 config.json
 config.local.json
@@ -26,6 +28,11 @@ sso_list.txt
 token.json
 grok2api/
 grok2api/cpa_export*/
+
+# Standardized run output (structure kept via .gitkeep; artifacts ignored)
+output/runs/*/
+output/runs/latest
+output/archive/
 
 *.log
 .DS_Store

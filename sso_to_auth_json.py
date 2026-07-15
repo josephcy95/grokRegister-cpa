@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -33,6 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urljoin
 
 from curl_cffi import requests
 
@@ -54,8 +56,27 @@ GROK_REFERRER = "grok-build"
 GROK_PLAN = "generic"
 GROK_VERSION = "0.2.93"
 GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
-# consent 提交用的 Next.js Server Action ID
-NEXT_ACTION_ID = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
+# consent 提交用的 Next.js Server Action ID（submitOAuth2Consent）
+# 会随 accounts.x.ai 部署变化。硬编码只作快速首试；失败时从 consent 页 JS
+# createServerReference(...,"submitOAuth2Consent") 自动抓取并缓存到进程内。
+NEXT_ACTION_ID = "401b73e22a5e68737d0037e1aa449fef82cd1b35fb"
+CONSENT_SERVER_ACTION_NAME = "submitOAuth2Consent"
+# process-local cache so multi-account converts only scrape once per deploy
+_cached_next_action_id: str | None = None
+
+# Match webpack/minified createServerReference bindings for the consent action.
+# Examples seen in accounts.x.ai chunks:
+#   createServerReference)("401b…", i.callServer, void 0, i.findSourceMapURL, "submitOAuth2Consent")
+#   createServerReference("401b…", …, "submitOAuth2Consent")
+_SUBMIT_OAUTH2_CONSENT_RE = re.compile(
+    r'createServerReference\)?\(\s*["\']([a-f0-9]{40,})["\']'
+    r'[^)]*?["\']' + re.escape(CONSENT_SERVER_ACTION_NAME) + r'["\']\s*\)',
+    re.DOTALL,
+)
+_SUBMIT_OAUTH2_CONSENT_RE_ALT = re.compile(
+    r'["\']([a-f0-9]{40,})["\']\s*,\s*[^,]{0,80},\s*[^,]{0,40},\s*[^,]{0,80},\s*'
+    r'["\']' + re.escape(CONSENT_SERVER_ACTION_NAME) + r'["\']',
+)
 
 # --- CLIProxyAPI (CPA) 扁平格式常量 ------------------------------------------
 # CPA 的 internal/auth/xai/token.go TokenStorage 读的是扁平字段。
@@ -133,13 +154,167 @@ def _parse_consent_code(body: str) -> str | None:
     return None
 
 
+def _extract_submit_oauth2_consent_id(js_or_html: str) -> str | None:
+    """Pull submitOAuth2Consent Next-Action id from a JS chunk or HTML string."""
+    if not js_or_html or CONSENT_SERVER_ACTION_NAME not in js_or_html:
+        return None
+    m = _SUBMIT_OAUTH2_CONSENT_RE.search(js_or_html)
+    if m:
+        return m.group(1)
+    m = _SUBMIT_OAUTH2_CONSENT_RE_ALT.search(js_or_html)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _iter_consent_script_urls(html: str, page_url: str) -> list[str]:
+    """Collect absolute /_next/static script URLs from consent HTML (deduped)."""
+    if not html:
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for src in re.findall(
+        r'''(?:src|href)=["']([^"']*_next/static/[^"']+\.js[^"']*)["']''',
+        html,
+        flags=re.I,
+    ):
+        abs_url = urljoin(page_url, src)
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
+        urls.append(abs_url)
+    return urls
+
+
+def discover_consent_next_action_id(
+    session,
+    consent_html: str = "",
+    consent_url: str = "",
+    log=print,
+) -> str | None:
+    """Discover live Next-Action id for submitOAuth2Consent from consent page assets.
+
+    Strategy:
+      1) Scan the consent HTML itself (rare; sometimes inlined).
+      2) Fetch each /_next/static/*.js referenced by the page and match
+         createServerReference(..., "submitOAuth2Consent").
+
+    Returns the 40+ hex id or None. On success updates process cache.
+    """
+    global _cached_next_action_id
+
+    base = consent_url or "https://accounts.x.ai/oauth2/consent"
+    # Prefer the HTML we already have from the authorize redirect.
+    html = consent_html or ""
+    if not html and consent_url:
+        try:
+            r = session.get(consent_url, impersonate="chrome", timeout=15, allow_redirects=True)
+            html = str(r.text or "")
+            base = str(r.url or base)
+        except Exception as exc:
+            log(f"  ⚠️ 刷新 consent 页失败（用于抓 Next-Action）: {exc}")
+            html = ""
+
+    found = _extract_submit_oauth2_consent_id(html)
+    if found:
+        _cached_next_action_id = found
+        log(f"  🔎 从 consent HTML 抓到 {CONSENT_SERVER_ACTION_NAME} Next-Action={found[:16]}…")
+        return found
+
+    script_urls = _iter_consent_script_urls(html, base)
+    if not script_urls:
+        log("  ⚠️ consent 页无 _next/static JS，无法自动抓 Next-Action")
+        return None
+
+    log(
+        f"  🔎 扫描 consent JS 抓取 {CONSENT_SERVER_ACTION_NAME} "
+        f"({len(script_urls)} chunks)…"
+    )
+    for url in script_urls:
+        try:
+            jr = session.get(url, impersonate="chrome", timeout=30)
+            js = str(jr.text or "")
+        except Exception:
+            continue
+        found = _extract_submit_oauth2_consent_id(js)
+        if found:
+            _cached_next_action_id = found
+            chunk = url.rsplit("/", 1)[-1]
+            log(
+                f"  🔎 已抓到 {CONSENT_SERVER_ACTION_NAME} "
+                f"Next-Action={found[:16]}… (chunk={chunk})"
+            )
+            return found
+
+    log(f"  ⚠️ 未在 consent JS 中找到 {CONSENT_SERVER_ACTION_NAME}")
+    return None
+
+
+def _resolve_next_action_id(
+    session,
+    consent_html: str = "",
+    consent_url: str = "",
+    log=print,
+    force_discover: bool = False,
+) -> str:
+    """Return best Next-Action id: process cache → scrape → hardcoded fallback."""
+    global _cached_next_action_id
+    if force_discover:
+        discovered = discover_consent_next_action_id(
+            session,
+            consent_html=consent_html,
+            consent_url=consent_url,
+            log=log,
+        )
+        if discovered:
+            return discovered
+    if _cached_next_action_id:
+        return _cached_next_action_id
+    return NEXT_ACTION_ID
+
+
+def _consent_action_not_found(status_code: int, body: str) -> bool:
+    """True when Next.js rejected the Next-Action id (stale deploy hash)."""
+    if status_code == 404:
+        return True
+    text = (body or "").lower()
+    return "server action not found" in text or "failed to find server action" in text
+
+
+def _post_oauth2_consent(
+    session,
+    consent_url: str,
+    consent_payload: str,
+    action_id: str,
+):
+    return session.post(
+        consent_url,
+        data=consent_payload,
+        headers={
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Accept": "text/x-component",
+            "Origin": "https://accounts.x.ai",
+            "Referer": consent_url,
+            "Next-Action": action_id,
+        },
+        impersonate="chrome",
+        timeout=15,
+        allow_redirects=True,
+    )
+
+
 def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in)。
 
     使用授权码流程（Authorization Code + PKCE）：
     authorize 注入 referrer=grok-build + plan=generic，
     consent 提交 referrer 置空。proxy 非空时全程走代理。
+
+    Next-Action id for submitOAuth2Consent is auto-discovered from consent page
+    JS when the hardcoded/cached id returns 404 Server action not found.
     """
+    global _cached_next_action_id
+
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session()
     if proxies:
@@ -186,6 +361,7 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         log(f"  ❌ authorize 异常: {e}")
         return None
     final_url = str(r.url)
+    consent_html = str(r.text or "")
     if "sign-in" in final_url or "sign-up" in final_url:
         log("  ❌ sso 无效")
         return None
@@ -208,27 +384,55 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         "principalId": "",
         "referrer": GROK_REFERRER,
     }])
+
+    action_id = _resolve_next_action_id(
+        s,
+        consent_html=consent_html,
+        consent_url=final_url,
+        log=log,
+        force_discover=False,
+    )
     try:
-        r = s.post(
-            final_url,
-            data=consent_payload,
-            headers={
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Accept": "text/x-component",
-                "Origin": "https://accounts.x.ai",
-                "Referer": final_url,
-                "Next-Action": NEXT_ACTION_ID,
-            },
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
-        )
+        r = _post_oauth2_consent(s, final_url, consent_payload, action_id)
     except Exception as e:
         log(f"  ❌ consent 异常: {e}")
         return None
+
+    # Stale Next-Action (xAI redeployed accounts.x.ai) → scrape live id and retry once.
+    if _consent_action_not_found(r.status_code, str(r.text)):
+        log(
+            f"  ⚠️ consent Next-Action 失效 "
+            f"(HTTP {r.status_code}: {str(r.text)[:80]}) — 自动从 consent JS 重抓…"
+        )
+        # Drop stale process cache so discovery cannot re-return the dead id.
+        if _cached_next_action_id == action_id:
+            _cached_next_action_id = None
+        fresh = discover_consent_next_action_id(
+            s,
+            consent_html=consent_html,
+            consent_url=final_url,
+            log=log,
+        )
+        if not fresh:
+            log(f"  ❌ consent HTTP {r.status_code}: {str(r.text)[:200]}")
+            return None
+        if fresh == action_id:
+            log("  ❌ 抓到的 Next-Action 与失效 id 相同，放弃")
+            log(f"  ❌ consent HTTP {r.status_code}: {str(r.text)[:200]}")
+            return None
+        action_id = fresh
+        try:
+            r = _post_oauth2_consent(s, final_url, consent_payload, action_id)
+        except Exception as e:
+            log(f"  ❌ consent 重试异常: {e}")
+            return None
+
     if r.status_code < 200 or r.status_code >= 300:
         log(f"  ❌ consent HTTP {r.status_code}: {str(r.text)[:200]}")
         return None
+    # Successful id → keep for subsequent accounts in this process.
+    _cached_next_action_id = action_id
+
     code = _parse_consent_code(str(r.text))
     if not code:
         log(f"  ❌ consent 未返回 code: {str(r.text)[:200]}")

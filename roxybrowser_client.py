@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -401,24 +402,103 @@ class RoxyBrowserClient:
             errors.append({"method": method, "path": path, "error": "empty items", "payload": payload})
         return {"ok": False, "items": [], "errors": errors}
 
+    @staticmethod
+    def _path_for_windows_host(path: str) -> str:
+        """Convert a WSL/Linux path into a Windows path Roxy (Win Chromium) can open.
+
+        Running the register script under WSL while Roxy is a Windows app is common.
+        Passing ``/home/...`` makes Roxy invent ``C:\\home\\...`` which does not exist
+        (manifest missing → open fails). Prefer:
+
+          1. Already-Windows path (C:\\... or \\\\wsl$\\...)
+          2. ``wslpath -w`` conversion
+          3. Manual /mnt/c → C:\\ rewrite
+          4. Original path (last resort)
+        """
+        raw = str(path or "").strip()
+        if not raw:
+            return raw
+        # Already Windows-style
+        if re.match(r"^[A-Za-z]:[\\/]", raw) or raw.startswith("\\\\"):
+            return raw.replace("/", "\\")
+        # Explicit WSL mount of a Windows drive: /mnt/c/Users/... → C:\Users\...
+        m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", raw)
+        if m:
+            drive = m.group(1).upper()
+            rest = m.group(2).replace("/", "\\")
+            return f"{drive}:\\{rest}"
+        # wslpath -w (best for pure Linux home under WSL)
+        try:
+            import subprocess
+
+            proc = subprocess.run(
+                ["wslpath", "-w", raw],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            out = (proc.stdout or "").strip()
+            if proc.returncode == 0 and out:
+                return out
+        except Exception:
+            pass
+        return raw
+
     def _resolve_turnstile_extension_path(self) -> str:
-        """Absolute path to turnstilePatch/ for Roxy create payload (if present)."""
+        """Absolute path to turnstilePatch/ for Roxy create payload (if present).
+
+        Returns a path suitable for the **Roxy host OS** (Windows when Roxy is Win).
+        """
         candidates = []
-        if self.turnstile_extension_path:
-            candidates.append(self.turnstile_extension_path)
-        # Prefer path next to this package / repo root
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(here, "turnstilePatch"))
-        # Optional Windows / shared override via env
+        # Optional Windows / shared override via env or config first
         env_p = str(os.environ.get("ROXY_TURNSTILE_EXTENSION_PATH") or "").strip()
         if env_p:
-            candidates.insert(0, env_p)
+            candidates.append(env_p)
+        if self.turnstile_extension_path:
+            candidates.append(self.turnstile_extension_path)
+        # Common Windows mirror when developing under WSL (copy turnstilePatch here)
+        try:
+            users_root = "/mnt/c/Users"
+            if os.path.isdir(users_root):
+                for name in os.listdir(users_root):
+                    mirror = os.path.join(
+                        users_root,
+                        name,
+                        "AppData",
+                        "Local",
+                        "grokRegister-cpa",
+                        "turnstilePatch",
+                    )
+                    if os.path.isdir(mirror):
+                        candidates.append(mirror)
+        except Exception:
+            pass
+        # Prefer path next to this package / repo root (last; needs wslpath on WSL)
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(here, "turnstilePatch"))
+
         for p in candidates:
-            ap = os.path.abspath(os.path.expanduser(str(p or "").strip()))
-            if ap and os.path.isdir(ap) and os.path.isfile(
-                os.path.join(ap, "manifest.json")
+            raw = str(p or "").strip()
+            if not raw:
+                continue
+            # Config may already be a Windows path; map to /mnt for existence check
+            check_path = raw
+            if re.match(r"^[A-Za-z]:[\\/]", raw):
+                drive = raw[0].lower()
+                rest = raw[2:].replace("\\", "/").lstrip("/")
+                check_path = f"/mnt/{drive}/{rest}"
+            else:
+                check_path = os.path.abspath(os.path.expanduser(raw))
+            if check_path and os.path.isdir(check_path) and os.path.isfile(
+                os.path.join(check_path, "manifest.json")
             ):
-                return ap
+                # Always hand Roxy a Windows-readable path when possible
+                win = self._path_for_windows_host(check_path if not re.match(r"^[A-Za-z]:", raw) else raw)
+                if re.match(r"^[A-Za-z]:[\\/]", win) or win.startswith("\\\\"):
+                    return win
+                # Fallback: if wslpath failed, still return check_path converted best-effort
+                return self._path_for_windows_host(check_path)
         return ""
 
     def _apply_extension_to_create_body(self, body: dict) -> None:
@@ -428,6 +508,10 @@ class RoxyBrowserClient:
         ``--load-extension=...``; others use ``extensionPath`` / ``extensions``.
         Unknown keys are usually ignored. Prefer packing the CRX in Roxy GUI
         once if your build does not honour these fields.
+
+        IMPORTANT: path must be readable by the **Windows** Roxy process. Do not
+        pass raw WSL ``/home/...`` paths — they become ``C:\\home\\...`` and break open.
+        Also avoid ``--disable-extensions-except`` (too aggressive; can break open).
         """
         if not self.load_turnstile_extension:
             return
@@ -448,26 +532,29 @@ class RoxyBrowserClient:
         if not ext:
             self._emit(
                 "[Roxy] turnstilePatch 未找到（跳过扩展注入）。"
-                "请确认仓库内 turnstilePatch/ 存在，或设置 roxy_turnstile_extension_path"
+                "请把扩展拷到 Windows 可读路径，并设置 roxy_turnstile_extension_path，"
+                "例如 C:\\\\Users\\\\Joseph\\\\AppData\\\\Local\\\\grokRegister-cpa\\\\turnstilePatch"
             )
             return
-        # Dual form: path fields + Chromium load-extension args
+        # Dual form: path fields + Chromium load-extension only (no disable-except)
         body.setdefault("extensionPath", ext)
         body.setdefault("extensionPaths", [ext])
         body.setdefault("extensions", [ext])
         load_arg = f"--load-extension={ext}"
-        disable_arg = "--disable-extensions-except=" + ext
         for key in ("chromeArgs", "browserArgs", "args"):
             existing = body.get(key)
             if existing is None:
-                body[key] = [disable_arg, load_arg]
+                body[key] = [load_arg]
             elif isinstance(existing, list):
-                for a in (disable_arg, load_arg):
-                    if a not in existing:
-                        existing.append(a)
+                if load_arg not in existing:
+                    existing.append(load_arg)
             elif isinstance(existing, str) and existing.strip():
-                body[key] = existing + " " + disable_arg + " " + load_arg
-        self._emit(f"[Roxy] turnstilePatch path={ext} (create 注入，若 Roxy 忽略字段则需 GUI 预装)")
+                if load_arg not in existing:
+                    body[key] = existing + " " + load_arg
+        self._emit(
+            f"[Roxy] turnstilePatch path={ext} "
+            f"(Windows 路径注入；若 open 仍失败请在 Roxy GUI 预装扩展)"
+        )
 
     def create_profile(self, payload: dict | None = None) -> str:
         self.ensure_token()
@@ -558,6 +645,7 @@ class RoxyBrowserClient:
         params["headless"] = self.open_headless
 
         # Also try load-extension on open args (some Roxy builds only honour open.args).
+        # Do NOT pass --disable-extensions-except (breaks Roxy open / other extensions).
         if self.load_turnstile_extension:
             ext = self._resolve_turnstile_extension_path()
             if ext:
@@ -566,10 +654,8 @@ class RoxyBrowserClient:
                     args = []
                     params["args"] = args
                 load_arg = f"--load-extension={ext}"
-                disable_arg = "--disable-extensions-except=" + ext
-                for a in (disable_arg, load_arg):
-                    if a not in args:
-                        args.append(a)
+                if load_arg not in args:
+                    args.append(load_arg)
 
         path = self.open_path.format(profile_id=pid)
         self._emit(
