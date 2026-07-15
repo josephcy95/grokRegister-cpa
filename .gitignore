@@ -34,6 +34,11 @@ output/runs/*/
 output/runs/latest
 output/archive/
 
+# Local ops / campaign scratch (IPs, PIDs, probe dumps — never commit)
+logs/
+output/campaign_logs/
+*.pid
+
 *.log
 .DS_Store
 .idea/
